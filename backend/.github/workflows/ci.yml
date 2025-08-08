@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+          pip install -e .[dev] || true
+
+      - name: Ruff
+        run: |
+          python -m pip install ruff==0.4.8
+          ruff check src tests
+
+      - name: Black (check)
+        run: |
+          python -m pip install black==25.1.0
+          black --check --diff src tests
+
+      - name: Mypy
+        run: |
+          python -m pip install mypy==1.10.0
+          mypy --show-error-codes --pretty src/app
+
+      - name: Run tests with coverage
+        env:
+          APP_ENV: test
+          APP_DEBUG: 'false'
+          APP_OPENAI_API_KEY: ''
+          RUN_MIGRATIONS: '0'
+        run: |
+          python -m pip install pytest pytest-asyncio pytest-cov anyio httpx
+          pytest -q
+
