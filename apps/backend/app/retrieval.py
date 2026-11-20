@@ -2,59 +2,97 @@ import asyncio
 from time import perf_counter
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Query, Depends, HTTPException
-from loguru import logger
 
 from .config import get_settings, Settings
-from .db import fetch, ensure_schema
-from .embeddings import get_model, _as_pgvector
+from .auth import Principal, require_user
+from .db import fetch
+from .embeddings import get_model_async, embed_query, _as_pgvector
 from .schemas import HybridSearchRequest, HybridSearchResponse, SearchResultItem
+from .sessions import authorize_session
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
 
 async def _dense_search(
     query_vector_pg: str,
-    session_id: Optional[str],
+    session_id: str,
     candidate_k: int,
+    *,
+    user_id: str,
 ) -> List[Dict[str, Any]]:
     """
     Leg 1: Dense Vector Similarity Search using pgvector cosine distance.
     Evaluates 1 - (e.embedding <=> q_vector).
     """
+    if not session_id or not user_id:
+        raise ValueError("Dense retrieval requires an owned session")
     query = """
     SELECT c.id as chunk_id, c.content, c.page_number, c.document_id, d.filename,
            1 - (e.embedding <=> $1::vector) as dense_score
     FROM embeddings e
     JOIN chunks c ON c.id = e.chunk_id
     JOIN documents d ON d.id = c.document_id
-    WHERE ($2::text IS NULL OR d.session_id = $2)
+    JOIN sessions s ON s.session_id = d.session_id
+    WHERE d.session_id = $2 AND s.user_id = $4
     ORDER BY e.embedding <=> $1::vector ASC
     LIMIT $3
     """
-    return await fetch(query, query_vector_pg, session_id, candidate_k)
+    return await fetch(query, query_vector_pg, session_id, candidate_k, user_id)
 
 
 async def _sparse_search(
     query_text: str,
-    session_id: Optional[str],
+    session_id: str,
     candidate_k: int,
+    *,
+    user_id: str,
 ) -> List[Dict[str, Any]]:
     """
     Leg 2: Sparse Lexical Full-Text Search using PostgreSQL ts_rank_cd on GIN index.
-    Upgraded to websearch_to_tsquery to allow natural language multi-term queries
-    to match without strict boolean AND collapse.
+    Retry empty ordinary questions with English-normalized OR terms. Explicit
+    web-search operators retain their native semantics without relaxation.
     """
+    import re
+
+    if not session_id or not user_id:
+        raise ValueError("Sparse retrieval requires an owned session")
+    if len(query_text) > 4000:
+        raise ValueError("Sparse queries cannot exceed 4000 characters")
     query = """
     SELECT c.id as chunk_id, c.content, c.page_number, c.document_id, d.filename,
            ts_rank_cd(c.content_tsv, websearch_to_tsquery('english', $1)) as sparse_score
     FROM chunks c
     JOIN documents d ON d.id = c.document_id
+    JOIN sessions s ON s.session_id = d.session_id
     WHERE c.content_tsv @@ websearch_to_tsquery('english', $1)
-      AND ($2::text IS NULL OR d.session_id = $2)
+      AND d.session_id = $2 AND s.user_id = $4
     ORDER BY sparse_score DESC
     LIMIT $3
     """
-    return await fetch(query, query_text, session_id, candidate_k)
+    rows = await fetch(query, query_text, session_id, candidate_k, user_id)
+    if rows or '"' in query_text or re.search(r"\bor\b|(?<!\w)-\S", query_text, re.IGNORECASE):
+        return rows
+
+    # Normalize/stem with the same English dictionary as content_tsv. Values
+    # remain bound; quote every normalized lexeme before assembling tsquery.
+    # No meaningful lexemes produces NULL, which matches no rows.
+    fallback = """
+    WITH fallback_query AS (
+        SELECT string_agg(quote_literal(lexeme), ' | ')::tsquery AS terms
+        FROM unnest(tsvector_to_array(to_tsvector('english', $1))) AS normalized(lexeme)
+    )
+    SELECT c.id as chunk_id, c.content, c.page_number, c.document_id, d.filename,
+           ts_rank_cd(c.content_tsv, f.terms) as sparse_score
+    FROM chunks c
+    JOIN documents d ON d.id = c.document_id
+    JOIN sessions s ON s.session_id = d.session_id
+    CROSS JOIN fallback_query f
+    WHERE c.content_tsv @@ f.terms
+      AND d.session_id = $2 AND s.user_id = $4
+    ORDER BY sparse_score DESC
+    LIMIT $3
+    """
+    return await fetch(fallback, query_text, session_id, candidate_k, user_id)
 
 
 def compute_rrf_fusion(
@@ -117,40 +155,47 @@ def compute_rrf_fusion(
     return results
 
 
+async def retrieve_candidates(
+    query: str, session_id: str, settings: Settings, candidate_k: int, *, user_id: str,
+    dense_weight: Optional[float] = None, sparse_weight: Optional[float] = None,
+    rrf_k: Optional[int] = None,
+) -> List[SearchResultItem]:
+    """One owner-scoped retrieval path shared by search and chat."""
+    model = await get_model_async(settings)
+    query_vector = _as_pgvector(await embed_query(model, query))
+    dense, sparse = await asyncio.gather(
+        _dense_search(query_vector, session_id, candidate_k, user_id=user_id),
+        _sparse_search(query, session_id, candidate_k, user_id=user_id),
+    )
+    return compute_rrf_fusion(
+        dense, sparse, k=rrf_k if rrf_k is not None else settings.rrf_k,
+        dense_weight=dense_weight if dense_weight is not None else settings.dense_weight,
+        sparse_weight=sparse_weight if sparse_weight is not None else settings.sparse_weight,
+        top_k=candidate_k,
+    )
+
+
 @router.post("/hybrid", response_model=HybridSearchResponse)
 async def hybrid_search_post(
     req: HybridSearchRequest,
     settings: Settings = Depends(get_settings),
+    principal: Principal = Depends(require_user),
 ):
     """
     Production Hybrid Search using Reciprocal Rank Fusion (RRF).
     Complies with Rules C-1, C-2, C-3, C-4, and C-5.
     """
-    await ensure_schema()
+    await authorize_session(req.session_id, principal.user_id)
+    if len(req.query) > settings.max_query_chars:
+        raise HTTPException(status_code=422, detail="Query exceeds the configured limit")
+    if req.dense_weight + req.sparse_weight <= 0:
+        raise HTTPException(status_code=422, detail="At least one retrieval weight must be positive")
     t0 = perf_counter()
-
-    # 1. Embed query vector
-    model = get_model(settings)
-    q_vec = model.encode([req.query], convert_to_numpy=True, normalize_embeddings=True)[0].tolist()
-    q_vec_pg = _as_pgvector(q_vec)
-
     candidate_k = max(req.top_k * 3, 20)
-
-    # 2. Parallel concurrent execution of Dense and Sparse retrieval (Rule C-4)
-    dense_future = _dense_search(q_vec_pg, req.session_id, candidate_k)
-    sparse_future = _sparse_search(req.query, req.session_id, candidate_k)
-
-    dense_candidates, sparse_candidates = await asyncio.gather(dense_future, sparse_future)
-
-    # 3. Apply Reciprocal Rank Fusion (Rule C-3)
-    fused_results = compute_rrf_fusion(
-        dense_results=dense_candidates,
-        sparse_results=sparse_candidates,
-        k=req.rrf_k,
-        dense_weight=req.dense_weight,
-        sparse_weight=req.sparse_weight,
-        top_k=req.top_k,
-    )
+    fused_results = (await retrieve_candidates(
+        req.query, req.session_id, settings, candidate_k, user_id=principal.user_id,
+        dense_weight=req.dense_weight, sparse_weight=req.sparse_weight, rrf_k=req.rrf_k,
+    ))[:req.top_k]
 
     elapsed_ms = int((perf_counter() - t0) * 1000)
 
@@ -164,10 +209,11 @@ async def hybrid_search_post(
 
 @router.get("/hybrid", response_model=HybridSearchResponse)
 async def hybrid_search_get(
-    q: str = Query(..., min_length=1, description="Search query string"),
-    session_id: Optional[str] = Query(None, description="Optional session ID"),
+    q: str = Query(..., min_length=1, max_length=4000, pattern=r"\S", description="Search query string"),
+    session_id: str = Query(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$", description="Owned session ID"),
     top_k: int = Query(5, ge=1, le=50),
     settings: Settings = Depends(get_settings),
+    principal: Principal = Depends(require_user),
 ):
     """Convenience GET endpoint wrapping the hybrid search POST contract."""
     req = HybridSearchRequest(
@@ -178,4 +224,4 @@ async def hybrid_search_get(
         sparse_weight=settings.sparse_weight,
         rrf_k=settings.rrf_k,
     )
-    return await hybrid_search_post(req, settings=settings)
+    return await hybrid_search_post(req, settings=settings, principal=principal)

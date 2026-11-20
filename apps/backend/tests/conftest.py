@@ -160,6 +160,10 @@ def isolated_backend(monkeypatch, request):
     get_settings.cache_clear()
     db._memory_store.reset()
     app.dependency_overrides.clear()
+    # Original API contract tests predate authentication; security tests use real tokens or explicit local overrides.
+    if request.path.name in {"test_gating.py", "test_retrieval.py", "test_upgrades.py"}:
+        from app.auth import Principal, require_user
+        app.dependency_overrides[require_user] = lambda: Principal(user_id="contract-user")
     monkeypatch.setattr(db, "_pool", None)
     monkeypatch.setattr(db, "_use_memory_fallback", True)
     monkeypatch.setattr(embeddings, "_model", ContractEncoder())

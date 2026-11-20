@@ -1,3 +1,5 @@
+"""Offline retrieval contracts, not semantic-model or PostgreSQL index quality."""
+
 import pytest
 import numpy as np
 from httpx import AsyncClient, ASGITransport
@@ -99,7 +101,7 @@ async def test_hybrid_search_end_to_end_and_attribution():
     _memory_store.reset()
 
     session_id = "test_hybrid_session"
-    await execute("INSERT INTO SESSIONS (session_id) VALUES ($1)", session_id)
+    await execute("INSERT INTO SESSIONS (session_id, user_id) VALUES ($1, $2)", session_id, "contract-user")
 
     doc_id = await fetchval(
         "INSERT INTO DOCUMENTS (session_id, filename, file_size, total_pages) VALUES ($1, $2, $3, $4) RETURNING id",
@@ -180,7 +182,7 @@ async def test_session_isolation_in_retrieval():
     _memory_store.reset()
 
     # Session A
-    await execute("INSERT INTO SESSIONS (session_id) VALUES ($1)", "session_A")
+    await execute("INSERT INTO SESSIONS (session_id, user_id) VALUES ($1, $2)", "session_A", "contract-user")
     doc_A = await fetchval(
         "INSERT INTO DOCUMENTS (session_id, filename, file_size, total_pages) VALUES ($1, $2, $3, $4) RETURNING id",
         "session_A", "doc_A.pdf", 100, 1
@@ -193,7 +195,7 @@ async def test_session_isolation_in_retrieval():
     await execute("INSERT INTO EMBEDDINGS (chunk_id, embedding, model_version) VALUES ($1, $2, $3)", chunk_A, emb_A, "test")
 
     # Session B
-    await execute("INSERT INTO SESSIONS (session_id) VALUES ($1)", "session_B")
+    await execute("INSERT INTO SESSIONS (session_id, user_id) VALUES ($1, $2)", "session_B", "contract-user")
     doc_B = await fetchval(
         "INSERT INTO DOCUMENTS (session_id, filename, file_size, total_pages) VALUES ($1, $2, $3, $4) RETURNING id",
         "session_B", "doc_B.pdf", 100, 1

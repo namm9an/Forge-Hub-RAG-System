@@ -1,345 +1,310 @@
+from bisect import bisect_right
 import hashlib
 import io
 import re
-from typing import List, Tuple, Optional
+import unicodedata
+from typing import List, Optional, Tuple
+from uuid import UUID
+
 import pdfplumber
 from pypdf import PdfReader
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Header, Form
-from fastapi import BackgroundTasks
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from loguru import logger
 
+from .auth import Principal, require_user
 from .config import get_settings, Settings
-from .db import ensure_schema, execute, fetchval, fetch
+from .db import execute, fetch, fetchval, transaction
+from .embeddings import _as_pgvector, _embed_texts, get_model, get_model_async, run_blocking
 from .schemas import DocumentsResponse, DocumentInfo
-from .embeddings import get_model, _embed_texts, _as_pgvector
+from .sessions import authorize_session
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 
 def _hash_text(text: str) -> str:
-    """Generate SHA-256 hash of text for deduplication (Rule B-4)."""
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
 
 
-def count_tokens(text: str) -> int:
-    """
-    Fast and accurate token estimator matching standard BPE tokenizers.
-    Splits on word boundaries and standalone punctuation tokens.
-    """
+def _tokenizer(tokenizer=None):
+    if tokenizer is None:
+        tokenizer = getattr(get_model(get_settings()), "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("The embedding model must expose its tokenizer")
+    return tokenizer
+
+
+def count_tokens(text: str, tokenizer=None) -> int:
+    """Count the actual model encoding, including its special tokens."""
     if not text:
         return 0
-    tokens = re.findall(r"\w+|[^\w\s]", text)
-    return len(tokens)
+    return len(_tokenizer(tokenizer).encode(text, add_special_tokens=True, truncation=False))
 
 
-def recursive_token_chunk(
-    text: str,
-    max_tokens: int = 350,
-    overlap_tokens: int = 50,
-) -> List[Tuple[str, int]]:
-    """
-    Recursive Token-Aware Chunker (Complies with Rules B-1 and B-2):
-    - Target: strictly <= max_tokens (default 350 tokens to respect 384-token embedding ceiling).
-    - Preserves semantic boundaries: paragraphs (\n\n) -> sentences -> words.
-    - Never cuts words or sentences in half arbitrarily.
-    - Returns list of (chunk_text, token_count).
-    """
-    text = text.strip()
-    if not text:
+def recursive_token_chunk(text: str, max_tokens: int = 350, overlap_tokens: int = 50, tokenizer=None) -> List[Tuple[str, int]]:
+    """Use tokenizer offsets so oversized subwords can split without discarding text."""
+    if not text or not text.strip():
         return []
-
-    total_tokens = count_tokens(text)
-    if total_tokens <= max_tokens:
-        return [(text, total_tokens)]
-
-    # 1. Split into paragraphs
-    raw_paragraphs = text.split("\n\n")
-    units: List[str] = []
-
-    for para in raw_paragraphs:
-        para = para.strip()
-        if not para:
-            continue
-        if count_tokens(para) <= max_tokens:
-            units.append(para)
+    tokenizer = _tokenizer(tokenizer)
+    max_tokens = min(max_tokens, int(getattr(tokenizer, "model_max_length", max_tokens)))
+    special = tokenizer.num_special_tokens_to_add(pair=False)
+    capacity = max_tokens - special
+    if capacity < 1 or overlap_tokens < 0:
+        raise ValueError("Token budget must admit content and overlap must be nonnegative")
+    if count_tokens(text, tokenizer) <= max_tokens:
+        return [(text, count_tokens(text, tokenizer))]
+    encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True, truncation=False)
+    offsets = list(encoded["offset_mapping"])
+    if not offsets or any(not (0 <= start < end <= len(text)) for start, end in offsets):
+        raise ValueError("A fast tokenizer with source offsets is required")
+    ends = [end for _, end in offsets]
+    chunks = []
+    start_index, start_char = 0, 0
+    while start_index < len(offsets):
+        end_index = min(start_index + capacity, len(offsets))
+        end_char = offsets[end_index][0] if end_index < len(offsets) else len(text)
+        if end_index < len(offsets):
+            segment = text[start_char:end_char]
+            boundaries = list(re.finditer(r"\n\s*\n|(?<=[.!?])\s+", segment))
+            if not boundaries:
+                boundaries = list(re.finditer(r"\s+", segment))
+            if boundaries and segment[:boundaries[-1].end()].strip():
+                end_char = start_char + boundaries[-1].end()
+        # Re-encoding a subword boundary can change its tokenization; verify every result.
+        while end_char > start_char and count_tokens(text[start_char:end_char], tokenizer) > max_tokens:
+            end_index -= 1
+            end_char = min(end_char, offsets[end_index][0])
+        if end_char <= start_char:
+            raise ValueError("The token budget cannot represent the next source character")
+        content = text[start_char:end_char]
+        chunks.append((content, count_tokens(content, tokenizer)))
+        if end_char == len(text):
+            break
+        consumed = bisect_right(ends, end_char)
+        next_index = max(start_index + 1, consumed - min(overlap_tokens, capacity - 1))
+        if overlap_tokens == 0:
+            next_index, next_char = consumed, end_char
         else:
-            # Paragraph exceeds max_tokens -> split into sentences
-            sentences = re.split(r"(?<=[.!?])\s+", para)
-            for sentence in sentences:
-                sentence = sentence.strip()
-                if not sentence:
-                    continue
-                if count_tokens(sentence) <= max_tokens:
-                    units.append(sentence)
-                else:
-                    # Very long sentence -> split on clause/word boundaries without severing words
-                    words = sentence.split()
-                    cur_part: List[str] = []
-                    cur_len = 0
-                    for word in words:
-                        w_len = count_tokens(word)
-                        if cur_len + w_len > max_tokens and cur_part:
-                            units.append(" ".join(cur_part))
-                            cur_part = [word]
-                            cur_len = w_len
-                        else:
-                            cur_part.append(word)
-                            cur_len += w_len
-                    if cur_part:
-                        units.append(" ".join(cur_part))
-
-    # 2. Greedily assemble units into chunks up to max_tokens with overlap
-    chunks: List[Tuple[str, int]] = []
-    current_units: List[str] = []
-    current_tokens = 0
-
-    for unit in units:
-        unit_tokens = count_tokens(unit)
-        if current_tokens + unit_tokens > max_tokens and current_units:
-            # Finalize current chunk
-            chunk_str = "\n\n".join(current_units) if "\n\n" in text else " ".join(current_units)
-            chunks.append((chunk_str, count_tokens(chunk_str)))
-
-            # Calculate overlap by taking trailing units up to overlap_tokens
-            overlap_units: List[str] = []
-            overlap_count = 0
-            for u in reversed(current_units):
-                u_cnt = count_tokens(u)
-                if overlap_count + u_cnt <= overlap_tokens:
-                    overlap_units.insert(0, u)
-                    overlap_count += u_cnt
-                else:
-                    break
-
-            current_units = overlap_units + [unit]
-            current_tokens = sum(count_tokens(u) for u in current_units)
-        else:
-            current_units.append(unit)
-            current_tokens += unit_tokens
-
-    if current_units:
-        final_str = "\n\n".join(current_units) if "\n\n" in text else " ".join(current_units)
-        chunks.append((final_str, count_tokens(final_str)))
-
+            next_char = offsets[next_index][0] if next_index < len(offsets) else end_char
+            while next_char < end_char and next_char > 0 and not text[next_char - 1].isspace() and not text[next_char].isspace():
+                next_char += 1
+            next_index = max(next_index, bisect_right(ends, next_char))
+        if next_char <= start_char:
+            next_index, next_char = consumed, end_char
+        start_index, start_char = next_index, next_char
     return chunks
 
 
-def _extract_pages_pdfplumber(file_bytes: bytes) -> List[Tuple[int, str]]:
-    """Extract page text tracking 1-indexed page numbers (Rule B-3)."""
-    pages: List[Tuple[int, str]] = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for idx, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
+def _extract_pdf(file_bytes: bytes, settings: Settings):
+    max_pages = getattr(settings, "max_pages_per_document", 500)
+    max_chars = getattr(settings, "max_extracted_chars", 2_000_000)
+
+    def collect(pages, extract_text):
+        if len(pages) > max_pages:
+            raise HTTPException(status_code=413, detail="PDF page limit exceeded")
+        extracted, total_chars = [], 0
+        for number, page in enumerate(pages, start=1):
+            text = extract_text(page) or ""
+            total_chars += len(text)
+            if total_chars > max_chars:
+                raise HTTPException(status_code=413, detail="PDF extracted text limit exceeded")
             if text.strip():
-                pages.append((idx, text))
-    return pages
+                extracted.append((number, text))
+        return extracted, len(pages)
 
-
-def _extract_pages_pypdf(file_bytes: bytes) -> List[Tuple[int, str]]:
-    """Fallback page extractor using pypdf."""
-    pages: List[Tuple[int, str]] = []
-    reader = PdfReader(io.BytesIO(file_bytes))
-    for idx, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        if text.strip():
-            pages.append((idx, text))
-    return pages
-
-
-async def _embed_and_store_chunks(chunk_records: List[dict], settings: Settings) -> int:
-    """Generate normalized vector embeddings and save to database."""
-    if not chunk_records:
-        return 0
     try:
-        model = get_model(settings)
-        texts = [c["content"] for c in chunk_records]
-        vectors = await _embed_texts(model, texts)
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            result = collect(pdf.pages, lambda page: page.extract_text(use_text_flow=True))
+            if result[0]:
+                return result
+    except HTTPException:
+        raise
+    except Exception:
+        logger.debug("Primary PDF extractor could not parse the document")
+    try:
+        result = collect(PdfReader(io.BytesIO(file_bytes)).pages, lambda page: page.extract_text())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="Corrupt or unreadable PDF") from exc
+    if not result[0]:
+        raise HTTPException(status_code=422, detail="PDF contains no extractable text")
+    return result
 
-        stored = 0
-        for record, vec in zip(chunk_records, vectors):
-            await execute(
-                """
-                INSERT INTO embeddings (chunk_id, embedding, model_version)
-                VALUES ($1, $2::vector, $3)
-                ON CONFLICT (chunk_id) DO NOTHING
-                """,
-                record["id"],
-                _as_pgvector(vec),
-                settings.embedding_model,
-            )
-            stored += 1
-        return stored
-    except Exception as e:
-        logger.error("Failed to generate embeddings for document chunks: {}", e)
-        return 0
+
+def _prepare_pdf(file_bytes, filename, settings, tokenizer, token_budget):
+    pages, total_pages = _extract_pdf(file_bytes, settings)
+    records, by_hash, raw_chunks = [], {}, 0
+    for page_number, text in pages:
+        chunks = recursive_token_chunk(text, max_tokens=token_budget, overlap_tokens=settings.chunk_overlap_tokens, tokenizer=tokenizer)
+        raw_chunks += len(chunks)
+        if raw_chunks > getattr(settings, "max_chunks_per_document", 10_000):
+            raise HTTPException(status_code=413, detail="PDF chunk limit exceeded")
+        for content, token_count in chunks:
+            content_hash = _hash_text(content)
+            if content_hash in by_hash:
+                record = by_hash[content_hash]
+                if page_number not in record["page_numbers"]:
+                    record["page_numbers"].append(page_number)
+                continue
+            record = {"content": content, "content_hash": content_hash, "page_number": page_number,
+                      "page_numbers": [page_number], "token_count": token_count, "chunk_index": len(records)}
+            records.append(record)
+            by_hash[content_hash] = record
+    if not records:
+        raise HTTPException(status_code=422, detail="PDF contains no usable text")
+    return {"filename": filename, "file_size": len(file_bytes), "total_pages": total_pages, "chunks": records}
+
+
+def _session_identifier(*identifiers):
+    supplied = [value for value in identifiers if value is not None]
+    if not supplied or any(not value.strip() for value in supplied):
+        raise HTTPException(status_code=422, detail="An explicit session_id is required")
+    if len(set(supplied)) != 1:
+        raise HTTPException(status_code=400, detail="Conflicting session identifiers")
+    return supplied[0]
+
+
+def _validate_file_metadata(file):
+    name = file.filename or ""
+    if (not name.lower().endswith(".pdf") or len(name) > 255 or any(c in name for c in "/\\[]")
+            or any(unicodedata.category(c) in {"Cc", "Cf", "Cs"} for c in name)):
+        raise HTTPException(status_code=400, detail="A safe PDF filename is required")
+    if file.content_type not in {"application/pdf", "application/octet-stream"}:
+        raise HTTPException(status_code=400, detail="Only PDF uploads are supported")
+
+
+async def _read_file(file: UploadFile, remaining_bytes: int) -> bytes:
+    if remaining_bytes < 0:
+        raise HTTPException(status_code=413, detail="Upload byte limit exceeded")
+    pieces, size = [], 0
+    while True:
+        piece = await file.read(min(65536, remaining_bytes - size + 1))
+        if not piece:
+            break
+        pieces.append(piece)
+        size += len(piece)
+        if size > remaining_bytes:
+            raise HTTPException(status_code=413, detail="Upload byte limit exceeded")
+    content = b"".join(pieces)
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=422, detail="Invalid PDF signature")
+    return content
 
 
 @router.get("", response_model=DocumentsResponse)
 async def list_documents(
-    session_id: Optional[str] = None,
+    session_id: Optional[str] = Query(None),
     x_session_id: Optional[str] = Header(None),
+    principal: Principal = Depends(require_user),
 ):
-    await ensure_schema()
-    effective_session = session_id or x_session_id
+    sid = _session_identifier(session_id, x_session_id)
+    await authorize_session(sid, principal.user_id)
     rows = await fetch(
         """
         SELECT d.id, d.filename, d.file_size, d.total_pages, d.session_id, d.created_at,
-               COALESCE((SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id), 0) AS chunks
-        FROM documents d
-        WHERE ($1::text IS NULL OR d.session_id = $1)
-        ORDER BY d.created_at DESC
-        """,
-        effective_session,
+               (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id) AS chunks
+        FROM documents d JOIN sessions s ON s.session_id = d.session_id
+        WHERE d.session_id = $1 AND s.user_id = $2 ORDER BY d.created_at DESC
+        """, sid, principal.user_id,
     )
-    docs = [
-        DocumentInfo(
-            id=str(r["id"]),
-            filename=r["filename"],
-            pages=r["total_pages"],
-            chunks=r["chunks"],
-            file_size=r["file_size"],
-            session_id=r["session_id"],
-            created_at=str(r["created_at"]) if r["created_at"] else None,
-        )
-        for r in rows
-    ]
-    return DocumentsResponse(documents=docs)
+    return DocumentsResponse(documents=[
+        DocumentInfo(id=str(row["id"]), filename=row["filename"], pages=row["total_pages"],
+                     chunks=row["chunks"], file_size=row["file_size"], session_id=row["session_id"],
+                     created_at=str(row["created_at"]) if row["created_at"] else None)
+        for row in rows
+    ])
 
 
 @router.delete("/{document_id}")
-async def delete_document(document_id: str):
-    await ensure_schema()
-    await execute("DELETE FROM documents WHERE id = $1", document_id)
-    return {"status": "ok", "deleted_document_id": document_id}
+async def delete_document(document_id: UUID, principal: Principal = Depends(require_user)):
+    async with transaction():
+        rows = await fetch(
+            "SELECT d.session_id FROM documents d JOIN sessions s ON s.session_id = d.session_id "
+            "WHERE d.id = $1 AND s.user_id = $2",
+            document_id, principal.user_id,
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Document not found")
+        sid = rows[0]["session_id"]
+        await authorize_session(sid, principal.user_id)
+        deleted = await execute("DELETE FROM documents WHERE id = $1 AND session_id = $2", document_id, sid)
+        if deleted != "DELETE 1":
+            raise HTTPException(status_code=404, detail="Document not found")
+        await execute("UPDATE sessions SET total_documents = GREATEST(total_documents - 1, 0) WHERE session_id = $1", sid)
+    return {"status": "ok", "deleted_document_id": str(document_id)}
 
 
 @router.post("/upload")
 async def upload_documents(
-    background: BackgroundTasks,
     files: List[UploadFile] = File(...),
-    session_id: Optional[str] = Form(None),
+    session_id_form: Optional[str] = Form(None, alias="session_id"),
+    session_id_query: Optional[str] = Query(None, alias="session_id"),
     x_session_id: Optional[str] = Header(None),
     settings: Settings = Depends(get_settings),
+    principal: Principal = Depends(require_user),
 ):
-    # Rule B-5: Dynamic Session Isolation
-    effective_session = session_id or x_session_id or "default"
-    max_files = settings.max_files_per_session
-    max_total_bytes = settings.max_total_bytes
-    chunk_size = settings.chunk_size_tokens
-    chunk_overlap = settings.chunk_overlap_tokens
-
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-    if len(files) > max_files:
-        raise HTTPException(status_code=400, detail=f"Maximum {max_files} files allowed per upload")
-
-    total_size = sum((f.size or 0) for f in files)
-    if total_size > max_total_bytes:
-        raise HTTPException(status_code=400, detail=f"Total upload size exceeds {max_total_bytes // (1024*1024)}MB limit")
-
-    await ensure_schema()
-
-    # Ensure session row exists (Rule B-5)
-    await execute(
-        """
-        INSERT INTO sessions (session_id, last_activity)
-        VALUES ($1, NOW())
-        ON CONFLICT (session_id) DO UPDATE SET last_activity = NOW()
-        """,
-        effective_session,
-    )
-
-    processed_documents = []
-
-    for f in files:
-        if not f.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail=f"File '{f.filename}' is not a PDF")
-
-        file_bytes = await f.read()
-
-        # Extract text page-by-page (Rule B-3)
-        pages_data: List[Tuple[int, str]] = []
+    sid = _session_identifier(session_id_query, session_id_form, x_session_id)
+    if not files or len(files) > settings.max_files_per_session:
+        raise HTTPException(status_code=400, detail="Upload file count limit exceeded")
+    for file in files:
+        _validate_file_metadata(file)
+    async with transaction():
+        await authorize_session(sid, principal.user_id, create=True)
+        usage = (await fetch(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(file_size), 0) AS total_bytes FROM documents WHERE session_id = $1", sid
+        ))[0]
+        if usage["count"] + len(files) > settings.max_files_per_session or usage["total_bytes"] >= settings.max_total_bytes:
+            raise HTTPException(status_code=413, detail="Session document quota exceeded")
+        inputs, total_bytes = [], 0
+        for file in files:
+            content = await _read_file(file, settings.max_total_bytes - usage["total_bytes"] - total_bytes)
+            total_bytes += len(content)
+            inputs.append((file.filename, content))
         try:
-            pages_data = _extract_pages_pdfplumber(file_bytes)
-            if not pages_data:
-                raise ValueError("pdfplumber extracted 0 pages, trying fallback")
-        except Exception as e:
-            logger.warning("pdfplumber extraction warning: {}, trying pypdf", e)
-            try:
-                pages_data = _extract_pages_pypdf(file_bytes)
-            except Exception as e2:
-                logger.error("pypdf extraction failed: {}", e2)
-                raise HTTPException(status_code=422, detail=f"Corrupt or unreadable PDF: {f.filename}")
+            model = await get_model_async(settings)
+            tokenizer = getattr(model, "tokenizer", None)
+            if tokenizer is None:
+                raise ValueError("Embedding tokenizer is unavailable")
+            token_budget = min(settings.chunk_size_tokens, int(getattr(model, "max_seq_length", settings.chunk_size_tokens)))
+            prepared = []
+            for filename, content in inputs:
+                prepared.append(await run_blocking(_prepare_pdf, content, filename, settings, tokenizer, token_budget))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("Document preparation failed: {}", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="Document embedding preparation is unavailable") from exc
 
-        if not pages_data:
-            raise HTTPException(status_code=422, detail=f"PDF '{f.filename}' contains no extractable text")
-
-        total_pages = max(p[0] for p in pages_data)
-
-        # Insert Document record
-        doc_id = await fetchval(
-            """
-            INSERT INTO documents (session_id, filename, file_size, total_pages)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id
-            """,
-            effective_session,
-            f.filename,
-            len(file_bytes),
-            total_pages,
+        results = []
+        for document in prepared:
+            doc_id = await fetchval(
+                "INSERT INTO documents (session_id, filename, file_size, total_pages) VALUES ($1, $2, $3, $4) RETURNING id",
+                sid, document["filename"], document["file_size"], document["total_pages"],
+            )
+            for start in range(0, len(document["chunks"]), 16):
+                batch = document["chunks"][start:start + 16]
+                try:
+                    vectors = await _embed_texts(model, [chunk["content"] for chunk in batch])
+                except Exception as exc:
+                    logger.warning("Document embedding failed: {}", type(exc).__name__)
+                    raise HTTPException(status_code=503, detail="Document embedding preparation is unavailable") from exc
+                for chunk, vector in zip(batch, vectors):
+                    chunk_id = await fetchval(
+                        """
+                        INSERT INTO chunks (document_id, chunk_index, content, content_hash, page_number, token_count, page_numbers)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
+                        """,
+                        doc_id, chunk["chunk_index"], chunk["content"], chunk["content_hash"],
+                        chunk["page_number"], chunk["token_count"], chunk["page_numbers"],
+                    )
+                    await execute(
+                        "INSERT INTO embeddings (chunk_id, embedding, model_version) VALUES ($1, $2::vector, $3)",
+                        chunk_id, _as_pgvector(vector), settings.embedding_model,
+                    )
+            results.append({"document_id": str(doc_id), "filename": document["filename"],
+                            "total_pages": document["total_pages"], "chunks_created": len(document["chunks"])})
+        await execute(
+            "UPDATE sessions SET total_documents = total_documents + $2, last_activity = NOW() WHERE session_id = $1",
+            sid, len(prepared),
         )
-
-        # Chunk each page preserving page_number and token limits (Rules B-1, B-2, B-3)
-        chunk_index = 0
-        new_chunks = []
-
-        for page_num, page_text in pages_data:
-            page_chunks = recursive_token_chunk(page_text, max_tokens=chunk_size, overlap_tokens=chunk_overlap)
-            for chunk_content, token_cnt in page_chunks:
-                c_hash = _hash_text(chunk_content)
-                chunk_id = await fetchval(
-                    """
-                    INSERT INTO chunks (document_id, chunk_index, content, content_hash, page_number, token_count)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (document_id, chunk_index) DO NOTHING
-                    RETURNING id
-                    """,
-                    doc_id,
-                    chunk_index,
-                    chunk_content,
-                    c_hash,
-                    page_num,
-                    token_cnt,
-                )
-                if chunk_id:
-                    new_chunks.append({"id": chunk_id, "content": chunk_content})
-                chunk_index += 1
-
-        # Automatically generate vector embeddings for new chunks
-        if new_chunks:
-            background.add_task(_embed_and_store_chunks, new_chunks, settings)
-
-        processed_documents.append({
-            "document_id": str(doc_id),
-            "filename": f.filename,
-            "total_pages": total_pages,
-            "chunks_created": chunk_index,
-        })
-
-    # Update session stats
-    await execute(
-        """
-        UPDATE sessions
-        SET total_documents = total_documents + $2,
-            last_activity = NOW()
-        WHERE session_id = $1
-        """,
-        effective_session,
-        len(processed_documents),
-    )
-
-    return {
-        "status": "success",
-        "session_id": effective_session,
-        "documents": processed_documents,
-    }
+    return {"status": "success", "session_id": sid, "documents": results}

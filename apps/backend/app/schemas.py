@@ -1,6 +1,8 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Literal, Annotated
 from enum import Enum
+
+SessionId = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
 
 
 class ConfidenceLevel(str, Enum):
@@ -22,11 +24,11 @@ class Source(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    query: str = Field(..., min_length=1, description="User question or search query")
-    session_id: Optional[str] = Field(default="default", description="Multi-user session identifier")
-    top_k: Optional[int] = Field(default=5, ge=1, le=50, description="Number of candidate chunks to retrieve")
-    threshold: Optional[float] = Field(default=0.35, ge=0.0, le=1.0, description="Minimum confidence threshold")
-    stream_format: Optional[str] = Field(default=None, description="Streaming protocol: 'sse' or 'text'")
+    query: str = Field(..., min_length=1, max_length=4000, pattern=r"\S", description="User question or search query")
+    session_id: SessionId
+    top_k: int = Field(default=5, ge=1, le=50, description="Number of candidate chunks to retrieve")
+    threshold: float = Field(default=0.35, ge=0.0, le=1.0, description="Minimum confidence threshold")
+    stream_format: Optional[Literal["sse", "text"]] = None
 
 
 class ChatResponse(BaseModel):
@@ -37,6 +39,8 @@ class ChatResponse(BaseModel):
     retrieval_ms: Optional[int] = None
     generation_ms: Optional[int] = None
     refusal_triggered: bool = False
+    generation_backend: Literal["provider", "extractive_fallback", "refusal"] = "refusal"
+    retrieval_query: Optional[str] = None
 
 
 class ChatHistoryItem(BaseModel):
@@ -56,8 +60,8 @@ class ChatHistoryResponse(BaseModel):
 
 
 class HybridSearchRequest(BaseModel):
-    query: str = Field(..., min_length=1, description="Search query string")
-    session_id: Optional[str] = Field(default=None, description="Filter by session ID if provided")
+    query: str = Field(..., min_length=1, max_length=4000, pattern=r"\S", description="Search query string")
+    session_id: SessionId
     top_k: int = Field(default=5, ge=1, le=50, description="Number of fused results to return")
     dense_weight: float = Field(default=0.6, ge=0.0, le=1.0, description="Weight for dense vector ranking")
     sparse_weight: float = Field(default=0.4, ge=0.0, le=1.0, description="Weight for sparse lexical ranking")

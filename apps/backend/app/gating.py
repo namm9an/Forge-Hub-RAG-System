@@ -6,12 +6,18 @@ Complies with:
 - Stage 2: Quantized Cross-Encoder Reranking (FlashRank with semantic fallback)
 """
 
+import json
+import math
 import re
+import threading
 from typing import List, Dict, Any, Tuple, Optional, Union
 from loguru import logger
 from .schemas import ConfidenceLevel, SearchResultItem, Source
 
 REFUSAL_MESSAGE = "The provided documents do not contain sufficient context to answer this question."
+
+class NeuralRerankUnavailable(RuntimeError):
+    pass
 
 
 def split_into_sentences(text: str) -> List[str]:
@@ -81,10 +87,9 @@ def prune_chunk_sentences(
     # Retain sentences meeting threshold
     retained = [s for s, score in scored_sentences if score >= min_sentence_relevance]
 
-    # Guardrail: if all sentences scored below threshold, keep the top 1 most relevant
+    # An exact-word score cannot choose between semantically paraphrased sentences.
     if not retained:
-        best_sentence = max(scored_sentences, key=lambda x: x[1])[0]
-        retained = [best_sentence]
+        retained = sentences
 
     pruned_text = " ".join(retained)
     return pruned_text, len(sentences), len(retained)
@@ -101,6 +106,8 @@ class CrossEncoderReranker:
         self.model_name = model_name
         self._ranker = None
         self._flashrank_checked = False
+        self._lock = threading.Lock()
+        self.backend = "heuristic"
 
     def _get_ranker(self):
         if not self._flashrank_checked:
@@ -110,7 +117,7 @@ class CrossEncoderReranker:
                 self._ranker = Ranker(model_name=self.model_name)
                 logger.info("Initialized FlashRank cross-encoder with model {}", self.model_name)
             except Exception as e:
-                logger.info("FlashRank not available ({}); fallback semantic scoring active.", e)
+                logger.info("FlashRank unavailable ({}); heuristic ranking active.", type(e).__name__)
                 self._ranker = None
         return self._ranker
 
@@ -133,12 +140,19 @@ class CrossEncoderReranker:
         query: str,
         candidates: List[Union[SearchResultItem, Dict[str, Any]]],
         top_k: Optional[int] = None,
+        *,
+        require_neural: bool = False,
     ) -> List[Union[SearchResultItem, Dict[str, Any]]]:
+        # Model initialization and inference share one lock across worker threads.
+        with self._lock:
+            return self._rerank(query, candidates, top_k, require_neural)
+
+    def _rerank(self, query, candidates, top_k, require_neural):
         if not candidates:
             return []
 
         # Shallow copy to avoid mutating external caller's order unexpectedly
-        items = list(candidates)
+        items = [dict(c) if isinstance(c, dict) else c.model_copy(deep=True) for c in candidates]
 
         ranker = self._get_ranker()
         if ranker is not None:
@@ -152,6 +166,9 @@ class CrossEncoderReranker:
                 results = ranker.rerank(rerank_req)
 
                 score_map = {int(r["id"]): float(r["score"]) for r in results if "id" in r and "score" in r}
+                if (len(results) != len(items) or set(score_map) != set(range(len(items)))
+                        or any(not math.isfinite(value) or not 0 <= value <= 1 for value in score_map.values())):
+                    raise ValueError("Incomplete or invalid neural reranker scores")
                 for i, c in enumerate(items):
                     if i in score_map:
                         sc = round(score_map[i], 4)
@@ -169,11 +186,15 @@ class CrossEncoderReranker:
                     return (sc if sc is not None else -1.0, base)
 
                 items.sort(key=sort_key, reverse=True)
+                self.backend = "flashrank"
                 return items[:top_k] if top_k else items
             except Exception as e:
-                logger.warning("FlashRank execution error ({}); falling back to semantic scoring.", e)
+                logger.warning("FlashRank execution failed ({}); heuristic ranking active.", type(e).__name__)
 
-        # Fallback semantic scoring: combines dense similarity, sentence-level relevance, and lexical frequency
+        self.backend = "heuristic"
+        if require_neural:
+            raise NeuralRerankUnavailable("Neural retrieval is unavailable")
+        # This weighted heuristic is not cross-encoder or semantic-quality evidence.
         for c in items:
             sc = self._compute_fallback_score(c, query)
             if isinstance(c, dict):
@@ -191,12 +212,14 @@ class CrossEncoderReranker:
 
 
 _global_reranker: Optional[CrossEncoderReranker] = None
+_reranker_init_lock = threading.Lock()
 
 
 def get_reranker(model_name: str = "ms-marco-TinyBERT-L-2-v2") -> CrossEncoderReranker:
     global _global_reranker
-    if _global_reranker is None:
-        _global_reranker = CrossEncoderReranker(model_name=model_name)
+    with _reranker_init_lock:
+        if _global_reranker is None or _global_reranker.model_name != model_name:
+            _global_reranker = CrossEncoderReranker(model_name=model_name)
     return _global_reranker
 
 
@@ -215,7 +238,7 @@ class EvidenceEvaluator:
     def evaluate(
         self,
         query: str,
-        candidates: List[Union[SearchResultItem, Dict[str, Any]]],
+        candidates: List[Union[SearchResultItem, Source, Dict[str, Any]]],
         threshold: Optional[float] = None,
     ) -> Tuple[ConfidenceLevel, bool, str]:
         """
@@ -227,18 +250,21 @@ class EvidenceEvaluator:
 
         # 1. Zero candidate chunks retrieved
         if not candidates:
-            logger.info("Evidence Gate: 0 candidates found for query '{}' -> Refusal triggered.", query)
+            logger.info("Evidence Gate: no candidates; refusal triggered.")
             return ConfidenceLevel.LOW, True, REFUSAL_MESSAGE
 
         # 2. Check maximum dense, sparse, and rerank scores
-        raw_dense = [getattr(c, "dense_score", None) if not isinstance(c, dict) else c.get("dense_score") for c in candidates]
-        dense_scores = [float(s) for s in raw_dense if s is not None]
-
-        raw_sparse = [getattr(c, "sparse_score", None) if not isinstance(c, dict) else c.get("sparse_score") for c in candidates]
-        sparse_scores = [float(s) for s in raw_sparse if s is not None]
-
-        raw_rerank = [getattr(c, "rerank_score", None) if not isinstance(c, dict) else c.get("rerank_score") for c in candidates]
-        rerank_scores = [float(s) for s in raw_rerank if s is not None]
+        try:
+            raw_dense = [getattr(c, "dense_score", None) if not isinstance(c, dict) else c.get("dense_score") for c in candidates]
+            dense_scores = [float(s) for s in raw_dense if s is not None]
+            raw_sparse = [getattr(c, "sparse_score", None) if not isinstance(c, dict) else c.get("sparse_score") for c in candidates]
+            sparse_scores = [float(s) for s in raw_sparse if s is not None]
+            raw_rerank = [getattr(c, "rerank_score", None) if not isinstance(c, dict) else c.get("rerank_score") for c in candidates]
+            rerank_scores = [float(s) for s in raw_rerank if s is not None]
+        except (TypeError, ValueError, OverflowError):
+            return ConfidenceLevel.LOW, True, REFUSAL_MESSAGE
+        if not all(math.isfinite(value) for value in dense_scores + sparse_scores + rerank_scores):
+            return ConfidenceLevel.LOW, True, REFUSAL_MESSAGE
 
         max_dense = max(dense_scores) if dense_scores else 0.0
         max_sparse = max(sparse_scores) if sparse_scores else 0.0
@@ -249,11 +275,9 @@ class EvidenceEvaluator:
         stop_words = {"what", "is", "the", "how", "why", "when", "where", "which", "who", "are", "a", "an", "in", "of", "for", "to"}
         content_q_tokens = q_tokens - stop_words or q_tokens
 
-        all_text = " ".join(
-            (getattr(c, "content", "") if not isinstance(c, dict) else c.get("content", "")).lower()
-            for c in candidates
-        )
-        terms_matched = sum(1 for term in content_q_tokens if term in all_text)
+        excerpts = [(c.get("content") if isinstance(c, dict) else c.content) or "" for c in candidates]
+        all_text = " ".join(excerpts).lower()
+        terms_matched = len(content_q_tokens.intersection(re.findall(r"\w+", all_text)))
         term_match_ratio = terms_matched / max(1, len(content_q_tokens))
 
         logger.debug(
@@ -262,9 +286,9 @@ class EvidenceEvaluator:
         )
 
         # 4. Out-of-Domain / Insufficient Evidence Condition:
-        # If dense similarity is below threshold AND sparse keyword score is negligible AND rerank score is low,
-        # OR if zero non-stopword query terms appear in retrieved context and dense & rerank scores are both low
-        if (max_dense < eff_threshold and max_sparse < 0.10 and max_rerank < 0.40) or (term_match_ratio == 0.0 and max_dense < 0.50 and max_rerank < 0.50):
+        # FTS rank is not confidence: incidental OR matches cannot override weak semantic evidence.
+        lexical_exact = max_sparse > 0 and bool(content_q_tokens) and terms_matched == len(content_q_tokens)
+        if (max_dense < eff_threshold and max_rerank < 0.40 and not lexical_exact) or (term_match_ratio == 0.0 and max_dense < 0.50 and max_rerank < 0.50):
             logger.info(
                 "Evidence Gate: Insufficient confidence (max_dense={:.4f} < {:.2f}, max_rerank={:.4f}) -> Refusal triggered.",
                 max_dense, eff_threshold, max_rerank,
@@ -282,14 +306,18 @@ def prune_and_format_context(
     query: str,
     candidates: List[Union[SearchResultItem, Dict[str, Any]]],
     min_sentence_relevance: float = 0.10,
+    max_context_chars: int = 24000,
 ) -> Tuple[str, List[Source]]:
     """
-    Applies Sentence-Level Noise Pruning (Rule D-2) to all candidates
-    and formats context with inline citation headers (Rule D-3):
-    [Doc: filename, Page: page_number, Chunk: chunk_id].
+    Pack whole admitted chunks into a bounded, explicitly untrusted evidence payload.
+
+    The compatibility name is retained, but exact-word sentence pruning is not a
+    semantic filter: it can delete the answer after the reranker admitted it.
+    Drop whole chunks that do not fit instead of silently truncating evidence.
     """
     formatted_passages: List[str] = []
     sources: List[Source] = []
+    used = 0
 
     for c in candidates:
         chunk_id = getattr(c, "chunk_id", None) or (c.get("chunk_id", "") if isinstance(c, dict) else "")
@@ -302,13 +330,17 @@ def prune_and_format_context(
         rerank_score = getattr(c, "rerank_score", None) if not isinstance(c, dict) else c.get("rerank_score")
         content = getattr(c, "content", None) or (c.get("content", "") if isinstance(c, dict) else "")
 
-        pruned_content, orig_count, ret_count = prune_chunk_sentences(
-            content, query, min_sentence_relevance=min_sentence_relevance
-        )
-
+        if not content or not chunk_id or int(page_no) < 1:
+            continue
+        if re.search(r"[\x00-\x1f\[\]]", str(filename)) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(chunk_id)):
+            continue
         citation_tag = f"[Doc: {filename}, Page: {page_no}, Chunk: {chunk_id}]"
-        passage = f"Passage {citation_tag}:\n{pruned_content}"
+        passage = json.dumps({"citation": citation_tag, "text": content}, ensure_ascii=False)
+        cost = len(passage) + (2 if formatted_passages else 0)
+        if used + cost > max_context_chars:
+            continue
         formatted_passages.append(passage)
+        used += cost
 
         sources.append(
             Source(
@@ -320,7 +352,7 @@ def prune_and_format_context(
                 dense_score=dense_score,
                 sparse_score=sparse_score,
                 rerank_score=rerank_score,
-                content=pruned_content,
+                content=content,
             )
         )
 

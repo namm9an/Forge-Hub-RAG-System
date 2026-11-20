@@ -1,26 +1,17 @@
--- =============================================================================
--- Forge Hub RAG System — Production Database Bootstrap DDL
--- Target: PostgreSQL 16 + pgvector
--- Specification: docs/FORGE_HUB_UPGRADE_BLUEPRINT.md
--- Compliance: docs/FORGE_HUB_EVALUATION_RULES.md (Rules A-1 through A-5)
--- =============================================================================
-
--- Enable required PostgreSQL extensions
+-- Forge Hub fresh schema; legacy upgrades use versioned migrations.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE EXTENSION IF NOT EXISTS vector;
-
--- 1. Sessions Table (Dynamic, isolated multi-user sessions)
 CREATE TABLE IF NOT EXISTS sessions (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     session_id TEXT UNIQUE NOT NULL,
+    user_id TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     last_activity TIMESTAMPTZ DEFAULT NOW(),
     total_messages INTEGER DEFAULT 0,
     total_documents INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_last_activity ON sessions(last_activity);
-
--- 2. Documents Table (Cascading foreign key from sessions)
+CREATE INDEX IF NOT EXISTS idx_sessions_owner_activity ON sessions(user_id, last_activity);
 CREATE TABLE IF NOT EXISTS documents (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -30,10 +21,6 @@ CREATE TABLE IF NOT EXISTS documents (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_documents_session_id ON documents(session_id);
-
--- 3. Chunks Table (With Full-Text Search tsvector & Metadata)
--- Rule A-1: content_tsv GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
--- Rule A-5: page_number INT and token_count INT columns
 CREATE TABLE IF NOT EXISTS chunks (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -41,20 +28,16 @@ CREATE TABLE IF NOT EXISTS chunks (
     content TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     page_number INTEGER NOT NULL DEFAULT 1,
+    page_numbers INTEGER[] NOT NULL DEFAULT '{}',
     token_count INTEGER NOT NULL DEFAULT 0,
     content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(document_id, chunk_index)
+    UNIQUE(document_id, chunk_index),
+    CONSTRAINT chunks_document_hash_unique UNIQUE(document_id, content_hash)
 );
-
--- Rule A-2: GIN index for lexical search
 CREATE INDEX IF NOT EXISTS idx_chunks_content_tsv ON chunks USING GIN(content_tsv);
 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_content_hash ON chunks(content_hash);
-
--- 4. Embeddings Table
--- Rule A-3: Vector index tuned for cosine similarity
--- Rule A-4: Cascades on chunk deletion
 CREATE TABLE IF NOT EXISTS embeddings (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     chunk_id UUID NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
@@ -63,11 +46,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(chunk_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_embeddings_vector_cosine 
+CREATE INDEX IF NOT EXISTS idx_embeddings_vector_cosine
 ON embeddings USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
-
--- 5. Chat History Table
 CREATE TABLE IF NOT EXISTS chat_history (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -81,26 +61,27 @@ CREATE TABLE IF NOT EXISTS chat_history (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_history_session ON chat_history(session_id);
 CREATE INDEX IF NOT EXISTS idx_chat_history_created_at ON chat_history(created_at DESC);
-
--- 6. Helper Functions & Procedures
-CREATE OR REPLACE FUNCTION cleanup_expired_sessions(max_age interval DEFAULT interval '1 hour')
+CREATE OR REPLACE FUNCTION cleanup_expired_sessions(p_user_id TEXT, max_age interval)
 RETURNS INTEGER AS $$
-DECLARE
-    deleted_count INTEGER;
+DECLARE deleted_count INTEGER;
 BEGIN
-    DELETE FROM sessions WHERE last_activity < NOW() - max_age;
+    DELETE FROM sessions WHERE user_id = p_user_id AND last_activity <= NOW() - max_age;
     GET DIAGNOSTICS deleted_count = ROW_COUNT;
     RETURN deleted_count;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION log_usage_event(p_session_id TEXT, p_event_type TEXT, p_event_data JSONB DEFAULT '{}'::jsonb)
 RETURNS VOID AS $$
 BEGIN
-    UPDATE sessions
-    SET last_activity = NOW(),
-        total_messages = CASE WHEN p_event_type = 'chat_message' THEN total_messages + 1 ELSE total_messages END,
-        total_documents = CASE WHEN p_event_type = 'document_upload' THEN total_documents + 1 ELSE total_documents END
-    WHERE session_id = p_session_id;
+    UPDATE sessions SET last_activity=NOW(),
+        total_messages=CASE WHEN p_event_type='chat_message' THEN total_messages+1 ELSE total_messages END,
+        total_documents=CASE WHEN p_event_type='document_upload' THEN total_documents+1 ELSE total_documents END
+    WHERE session_id=p_session_id;
 END;
 $$ LANGUAGE plpgsql;
+CREATE TABLE IF NOT EXISTS auth_rate_limits (
+    user_id TEXT PRIMARY KEY,
+    window_start TIMESTAMPTZ NOT NULL,
+    used INTEGER NOT NULL CHECK (used > 0)
+);
+CREATE INDEX IF NOT EXISTS idx_auth_rate_limits_window ON auth_rate_limits(window_start);

@@ -10,5 +10,7 @@ async def test_health():
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.get("/health")
         assert resp.status_code == status.HTTP_200_OK
-        assert resp.json()["status"] == "healthy"
+        assert resp.json()["status"] == "alive"
+        readiness = await ac.get("/ready")
+        assert readiness.status_code == 503  # Missing auth/persistent storage is never ready.
 

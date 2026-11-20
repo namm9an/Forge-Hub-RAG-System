@@ -1,3 +1,5 @@
+"""Offline gating/streaming contracts; provider and model quality need separate evaluation."""
+
 import pytest
 import numpy as np
 from httpx import AsyncClient, ASGITransport
@@ -120,7 +122,7 @@ async def test_chat_endpoint_refusal_gate_integration():
     _memory_store.reset()
 
     session_id = "test_gating_session"
-    await execute("INSERT INTO SESSIONS (session_id) VALUES ($1)", session_id)
+    await execute("INSERT INTO SESSIONS (session_id, user_id) VALUES ($1, $2)", session_id, "contract-user")
 
     doc_id = await fetchval(
         "INSERT INTO DOCUMENTS (session_id, filename, file_size, total_pages) VALUES ($1, $2, $3, $4) RETURNING id",
@@ -175,7 +177,7 @@ async def test_chat_stream_delivers_tokens():
     _memory_store.reset()
 
     session_id = "test_stream_session"
-    await execute("INSERT INTO SESSIONS (session_id) VALUES ($1)", session_id)
+    await execute("INSERT INTO SESSIONS (session_id, user_id) VALUES ($1, $2)", session_id, "contract-user")
 
     doc_id = await fetchval(
         "INSERT INTO DOCUMENTS (session_id, filename, file_size, total_pages) VALUES ($1, $2, $3, $4) RETURNING id",

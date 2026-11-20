@@ -1,3 +1,5 @@
+"""Offline upgrade contracts; reranking cases exercise fallback scoring, not neural quality."""
+
 import pytest
 import numpy as np
 from pathlib import Path
@@ -201,7 +203,7 @@ async def test_db_memory_store_session_cascading_deletion():
     _memory_store.reset()
 
     sid = "cascade_test_session"
-    await execute("INSERT INTO SESSIONS (session_id) VALUES ($1)", sid)
+    await execute("INSERT INTO SESSIONS (session_id, user_id) VALUES ($1, $2)", sid, "contract-user")
 
     doc_id = await fetchval(
         "INSERT INTO DOCUMENTS (session_id, filename, file_size, total_pages) VALUES ($1, $2, $3, $4) RETURNING id",
@@ -243,7 +245,7 @@ async def test_chat_stream_sse_and_chunked_formats():
     """Verify Upgrade 5: streaming supports both SSE (text/event-stream) and chunked transfer encoding."""
     _memory_store.reset()
     sid = "stream_format_session"
-    await execute("INSERT INTO SESSIONS (session_id) VALUES ($1)", sid)
+    await execute("INSERT INTO SESSIONS (session_id, user_id) VALUES ($1, $2)", sid, "contract-user")
 
     doc_id = await fetchval(
         "INSERT INTO DOCUMENTS (session_id, filename, file_size, total_pages) VALUES ($1, $2, $3, $4) RETURNING id",
