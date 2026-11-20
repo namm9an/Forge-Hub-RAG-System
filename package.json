@@ -2,7 +2,7 @@
   "name": "advanced-rag-chatbot",
   "version": "0.1.0",
   "private": true,
-  "packageManager": "pnpm@9.0.0",
+  "packageManager": "npm@11.20.0",
   "workspaces": [
     "apps/*",
     "packages/*"

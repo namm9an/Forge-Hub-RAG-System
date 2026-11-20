@@ -143,10 +143,12 @@ uvicorn app.main:create_app --factory --reload --port 8000
 * Interactive Documentation: `http://localhost:8000/docs`
 
 ### 4. Launch Frontend
+
+Run these commands from the repository root in a separate terminal.
+
 ```bash
-cd apps/frontend
-pnpm install
-pnpm dev
+npm ci
+npm run dev --workspace @advanced-rag/frontend
 ```
 * Frontend Interface: `http://localhost:3000`
 
