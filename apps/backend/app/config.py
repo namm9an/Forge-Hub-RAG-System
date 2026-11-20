@@ -22,7 +22,6 @@ class Settings(BaseSettings):
     backend_host: str = Field(default="127.0.0.1", description="FastAPI server host")
     allowed_origins: str = Field(default="http://localhost:3000", description="CORS allowed origins (comma-separated)")
     log_level: str = Field(default="INFO", description="Loguru logging level")
-    jwt_secret: str = Field(default="forge_hub_rag_production_secret_key", description="JWT secret key")
 
     # Database Configuration (PostgreSQL 16 + pgvector)
     vector_db_url: Optional[str] = Field(default=None, description="PostgreSQL connection string (with pgvector)")

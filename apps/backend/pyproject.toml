@@ -1,3 +1,10 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "postgres: real PostgreSQL/pgvector tests; require --run-postgres and a separate disposable test DSN",
+    "protocol: bounded real loopback HTTP/parser tests; require --run-protocol",
+]

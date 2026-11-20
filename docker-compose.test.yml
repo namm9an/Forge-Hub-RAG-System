@@ -1,0 +1,17 @@
+# Disposable integration-test database; no application database volumes.
+services:
+  postgres-test:
+    image: pgvector/pgvector@sha256:484e838076e04939d27d3e176e91c86eea96236126023be8d3059761122e579f
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: forge_hub_test_only
+      POSTGRES_DB: forge_hub_test
+    ports:
+      - "127.0.0.1::5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d forge_hub_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
