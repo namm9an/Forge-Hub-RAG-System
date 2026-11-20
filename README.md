@@ -1,8 +1,10 @@
 # Forge Hub RAG System
 
-> Production-grade hybrid retrieval-augmented generation engine with HNSW vector indexing, reciprocal rank fusion, quantized cross-encoder reranking, and evidence-gated hallucination defense.
+Backend hardening is in progress; frontend work is deferred.
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
+> Hybrid retrieval-augmented generation backend under active hardening with HNSW vector indexing, reciprocal rank fusion, quantized cross-encoder reranking, and evidence-gated hallucination defense.
+
+[![Python](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.111%2B-009688.svg)](https://fastapi.tiangolo.com)
 [![Next.js](https://img.shields.io/badge/Next.js-14-black.svg)](https://nextjs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.5-blue.svg)](https://typescriptlang.org)
@@ -42,12 +44,12 @@ flowchart TD
         Candidates --> Rerank["FlashRank Cross-Encoder\nQuery-Chunk Token Cross-Attention"]
         Rerank --> Gate{"Evidence Confidence Gate\n(Dense + Sparse + Cross-Encoder Scores)"}
         Gate -->|Unanswerable / Out-of-Domain| Refusal["Calibrated Refusal:\n'Context insufficient to answer'"]
-        Gate -->|Confidence Met| Pruner["Sentence-Level Noise Pruner\nPer-sentence relevance thresholding"]
+        Gate -->|Confidence Met| Pruner["Bounded Context Packing\nPreserve whole admitted evidence"]
     end
 
     subgraph Generation ["4. Attributed Generation & Streaming"]
-        Pruner --> Context["Cleaned Context + Exact Citations\n[Doc: file, Page: no, Chunk: id]"]
-        Context --> LLM["LLM Synthesis (OpenRouter / Local Engine)"]
+        Pruner --> Context["Admitted Context + Exact Citations\n[Doc: file, Page: no, Chunk: id]"]
+        Context --> LLM["LLM Synthesis (Gemini / OpenRouter / Extractive Fallback)"]
         LLM --> Stream["SSE Token Stream (/api/chat/stream)"]
         Refusal --> Stream
     end
@@ -68,11 +70,11 @@ flowchart TD
 
 ### 3. Strict 350-Token Chunk Boundary vs. 512-Token Default
 * **Decision:** Enforce a strict ceiling of 350 tokens (with 50-token sliding overlap) during document segmentation.
-* **Trade-Off:** While modern embedding models accept 512-token sequence lengths, `sentence-transformers/all-mpnet-base-v2` has an effective position embedding capacity of 384 tokens. Standard 512-token chunking results in silent truncation of the tail 128 tokens during embedding generation. Capping chunks at 350 tokens ensures $100\%$ token coverage without data loss while preserving complete sentence boundaries.
+* **Trade-Off:** While modern embedding models accept 512-token sequence lengths, `sentence-transformers/all-mpnet-base-v2` has an effective position embedding capacity of 384 tokens. Standard 512-token chunking results in silent truncation of the tail 128 tokens during embedding generation. Chunks count actual model tokens including special tokens, preserve source spans and split oversized units when necessary.
 
 ### 4. Stage-2 Quantized Cross-Encoder Reranking
 * **Decision:** Implement a two-stage retrieval pattern pairing Stage-1 hybrid search (top-20 candidates) with Stage-2 FlashRank quantized ONNX cross-encoder reranking before prompt synthesis.
-* **Trade-Off:** Bi-encoders embed queries and documents independently into vector space, missing fine-grained token-level cross-interactions. Full cross-encoders provide high precision but are computationally prohibitive to run across an entire database. A two-stage pipeline restricts cross-attention evaluation to the top-20 retrieved candidates, improving MRR@5 with negligible latency overhead.
+* **Trade-Off:** Bi-encoders embed queries and documents independently into vector space, missing fine-grained token-level cross-interactions. Full cross-encoders provide high precision but are computationally prohibitive to run across an entire database. A two-stage pipeline restricts cross-attention evaluation to the top-20 retrieved candidates, with the quality and latency trade-off measured by the diagnostic harness.
 
 ---
 
@@ -88,12 +90,12 @@ Forge-Hub-RAG-System/
 │   │   │   ├── db.py                # asyncpg connection pool & dual-engine storage
 │   │   │   ├── documents.py         # Multi-page PDF ingestion & token chunker
 │   │   │   ├── embeddings.py        # SentenceTransformer embedding worker
-│   │   │   ├── gating.py            # Evidence evaluator & sentence noise pruner
+│   │   │   ├── gating.py            # Evidence evaluator & bounded context packing
 │   │   │   ├── main.py              # FastAPI app factory & lifecycle handlers
 │   │   │   ├── retrieval.py         # Parallel dense + sparse hybrid RRF search
 │   │   │   └── schemas.py           # Pydantic v2 domain models
-│   │   ├── tests/                   # 27 automated unit and integration tests
-│   │   ├── requirements.txt         # Pinned backend dependencies
+│   │   ├── tests/                   # Offline contracts + opt-in real database/protocol tests
+│   │   ├── requirements.txt         # Supported backend dependency bounds + platform lock
 │   │   └── pyproject.toml           # Pytest & tool configurations
 │   └── frontend/                    # Next.js 14 App Router UI
 │       ├── app/                     # React Server Components & client views
@@ -114,35 +116,46 @@ Forge-Hub-RAG-System/
 
 ## Quick Start
 
-### 1. Start Infrastructure
-Launch PostgreSQL 16 with `pgvector` pre-configured with the schema and indexes:
-```bash
-docker compose up -d
-```
+### 1. Configure Environment
+Copy the example configuration and set `FORGE_HUB_POSTGRES_PASSWORD`, the local PostgreSQL DSN and
+the trusted RS256 issuer, public key and audience. Gemini and OpenRouter are optional. Local
+extraction is explicitly labeled when no provider is used. See the [backend setup](apps/backend/README.md)
+for production migration/runtime identities and model warmup.
 
-### 2. Configure Environment
-Copy the example environment file and configure optional LLM keys (the system includes local fallback synthesis if external API keys are omitted):
 ```bash
 cp .env.example .env
 ```
 
-### 3. Launch Backend
+### 2. Start PostgreSQL
+
+```bash
+docker compose up -d postgres
+```
+
+### 3. Migrate the Local Database and Launch the Backend
+
+Apply the versioned migrations before the backend starts. For existing databases, follow the
+backup and migration procedure in the [database setup guide](scripts/DB_SETUP.md).
+
 ```bash
 cd apps/backend
-python -m venv .venv
+python3.12 -m venv .venv
 
 # On Linux/macOS:
 source .venv/bin/activate
 # On Windows:
 .venv\Scripts\activate
 
-pip install -r requirements.txt
+# On the verified Windows/Python 3.12 platform:
+pip install -r requirements.win-py312.lock
+# Other platforms resolve requirements.txt and run the same verification gates.
+python -m app.migrate --apply
 uvicorn app.main:create_app --factory --reload --port 8000
 ```
 * API Root: `http://localhost:8000`
 * Interactive Documentation: `http://localhost:8000/docs`
 
-### 4. Launch Frontend
+### Existing frontend prototype (work deferred)
 ```bash
 cd apps/frontend
 pnpm install
@@ -154,11 +167,14 @@ pnpm dev
 
 ## API Endpoints
 
+Every private `/api/*` route requires a signed Bearer token and an owned, explicit session scope.
+The existing prototype must adopt this contract before integration; frontend work remains deferred.
+
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `GET` | `/health` | Health check verifying database pool connectivity |
+| `GET` | `/health` | Process liveness; `/ready` separately checks readiness |
 | `POST` | `/api/documents/upload` | Ingests multi-page technical PDFs, chunks at 350 tokens, and stores vectors |
-| `GET` | `/api/documents/list` | Lists ingested documents scoped to the active session |
+| `GET` | `/api/documents` | Lists ingested documents scoped to the active session |
 | `POST` | `/api/chat` | Non-streaming hybrid retrieval, evidence gating, and attributed answer synthesis |
 | `POST` | `/api/chat/stream` | Server-Sent Events (SSE) streaming tokens with latency profiling metadata |
 | `GET` | `/api/chat/history` | Fetches historical session turns with retrieval and generation latency metrics |
@@ -175,9 +191,9 @@ Run the test suite from the repository root:
 python -m pytest apps/backend/tests -v
 ```
 
-Execute the automated benchmark harness across factual, multi-chunk, and out-of-domain evaluation suites:
+Run diagnostics only against an explicit loopback disposable `forge_hub_test` database. It uses a temporary schema, actual handlers and local extraction; failed metrics cause a nonzero exit, and unmeasured triad metrics remain unmeasured:
 ```bash
-python scripts/benchmark_rag.py
+python scripts/benchmark_rag.py --database-url "$FORGE_HUB_TEST_DATABASE_URL"
 ```
 
 ---

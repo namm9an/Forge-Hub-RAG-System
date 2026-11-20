@@ -14,6 +14,13 @@ import io
 import re
 import json
 import asyncio
+import argparse
+import tempfile
+import uuid
+from contextlib import ExitStack
+from datetime import datetime, timezone
+from urllib.parse import urlsplit, unquote
+from unittest.mock import patch
 from pathlib import Path
 from time import perf_counter
 from typing import List, Dict, Any, Tuple
@@ -29,13 +36,13 @@ BACKEND_DIR = next((d for d in candidates if d.is_dir()), REPO_ROOT / "apps" / "
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app.config import get_settings
-from app.db import ensure_schema, execute, fetchval, _memory_store
-from app.documents import recursive_token_chunk, _hash_text, count_tokens
-from app.embeddings import get_model, _embed_texts, _as_pgvector
-from app.retrieval import _dense_search, _sparse_search, compute_rrf_fusion
-from app.gating import EvidenceEvaluator, prune_and_format_context, REFUSAL_MESSAGE
-from app.schemas import SearchResultItem, ConfidenceLevel
+from app.config import Settings
+from app.auth import Principal
+from app.chat import chat
+from app.schemas import ChatRequest
+from app.gating import get_reranker
+from app.gating import REFUSAL_MESSAGE
+from app.schemas import SearchResultItem
 
 # Multi-Page Technical PDF Dataset
 TECHNICAL_PAGES = [
@@ -334,73 +341,30 @@ def generate_benchmark_pdf(pages_text: List[str]) -> bytes:
 
 
 async def ingest_benchmark_dataset(session_id: str, settings) -> Tuple[str, int]:
-    """Ingests the multi-page technical PDF into the RAG pipeline."""
-    print(f"[1/4] Ingesting multi-page benchmark technical document into session '{session_id}'...")
-    await ensure_schema()
-    _memory_store.reset()
-
-    await execute("INSERT INTO SESSIONS (session_id) VALUES ($1)", session_id)
-
-    doc_id = await fetchval(
-        """
-        INSERT INTO DOCUMENTS (session_id, filename, file_size, total_pages)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id
-        """,
-        session_id,
-        "distributed_database_architecture.pdf",
-        len("".join(TECHNICAL_PAGES)),
-        len(TECHNICAL_PAGES),
+    """Use the application's complete ingestion path, including atomic embedding writes."""
+    from fastapi import UploadFile
+    from starlette.datastructures import Headers
+    from app.documents import upload_documents
+    response = await upload_documents(
+        files=[UploadFile(io.BytesIO(generate_benchmark_pdf(TECHNICAL_PAGES)), filename="distributed_database_architecture.pdf",
+                          headers=Headers({"content-type": "application/pdf"}))],
+        session_id_query=session_id, session_id_form=None, x_session_id=None,
+        settings=settings, principal=Principal("benchmark-owner"),
     )
-
-    model = get_model(settings)
-    total_chunks = 0
-    chunk_records = []
-
-    for page_idx, page_text in enumerate(TECHNICAL_PAGES, start=1):
-        chunks = recursive_token_chunk(page_text, max_tokens=512, overlap_tokens=64)
-        for chunk_idx, (chunk_content, token_cnt) in enumerate(chunks):
-            c_hash = _hash_text(chunk_content)
-            cid = await fetchval(
-                """
-                INSERT INTO CHUNKS (document_id, chunk_index, content, content_hash, page_number, token_count)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id
-                """,
-                doc_id,
-                total_chunks,
-                chunk_content,
-                c_hash,
-                page_idx,
-                token_cnt,
-            )
-            chunk_records.append({"id": cid, "content": chunk_content})
-            total_chunks += 1
-
-    # Generate and persist real vector embeddings (Rule C-1)
-    texts = [c["content"] for c in chunk_records]
-    vectors = await _embed_texts(model, texts)
-    for c_rec, vec in zip(chunk_records, vectors):
-        await execute(
-            """
-            INSERT INTO EMBEDDINGS (chunk_id, embedding, model_version)
-            VALUES ($1, $2::vector, $3)
-            """,
-            c_rec["id"],
-            _as_pgvector(vec),
-            settings.embedding_model,
-        )
-
-    print(f"      Document ingested successfully: {len(TECHNICAL_PAGES)} pages, {total_chunks} chunks embedded.")
-    return doc_id, total_chunks
+    document = response["documents"][0]
+    return document["document_id"], document["chunks_created"]
 
 
-async def run_benchmark():
-    settings = get_settings()
-    session_id = "forge_hub_benchmark_session"
+def threshold_status(value, target, *, less_than=False):
+    if value is None:
+        return "NOT MEASURED"
+    return "PASS" if (value < target if less_than else value >= target) else "FAIL"
+
+
+async def run_benchmark(settings, session_id, output_dir):
 
     print("================================================================================")
-    print(" Forge Hub RAG System — Production Benchmark & Evaluation Harness")
+    print(" Forge Hub RAG System — Application-Pipeline Diagnostic Benchmark")
     print("================================================================================")
 
     # 1. Ingest Dataset
@@ -410,9 +374,6 @@ async def run_benchmark():
 
     # 2. Execute Evaluation Queries across 3 Suites
     print(f"\n[2/4] Executing 24 benchmark queries across 3 evaluation suites...")
-    evaluator = EvidenceEvaluator(default_threshold=settings.similarity_threshold)
-    model = get_model(settings)
-
     retrieval_latencies: List[float] = []
     generation_latencies: List[float] = []
     total_latencies: List[float] = []
@@ -424,6 +385,8 @@ async def run_benchmark():
     total_trap_queries = 0
 
     query_results_log: List[Dict[str, Any]] = []
+    generation_backends = set()
+    reranker_backends = set()
 
     for suite_info in BENCHMARK_SUITES:
         suite_name = suite_info["suite"]
@@ -439,49 +402,23 @@ async def run_benchmark():
 
             t_q_start = perf_counter()
 
-            # A. Retrieval Step
-            t_r_start = perf_counter()
-            q_vec = model.encode([query_text], convert_to_numpy=True, normalize_embeddings=True)[0].tolist()
-            q_vec_pg = _as_pgvector(q_vec)
-
-            dense_res = await _dense_search(q_vec_pg, session_id, 20)
-            sparse_res = await _sparse_search(query_text, session_id, 20)
-
-            candidates: List[SearchResultItem] = compute_rrf_fusion(
-                dense_results=dense_res,
-                sparse_results=sparse_res,
-                k=settings.rrf_k,
-                dense_weight=settings.dense_weight,
-                sparse_weight=settings.sparse_weight,
-                top_k=5,
+            result = await chat(
+                ChatRequest(query=query_text, session_id=session_id, top_k=5, threshold=settings.similarity_threshold),
+                settings=settings, principal=Principal("benchmark-owner"),
             )
-            r_ms = (perf_counter() - t_r_start) * 1000.0
+            r_ms = result.retrieval_ms or 0
+            g_ms = result.generation_ms or 0
             retrieval_latencies.append(r_ms)
-
-            # B. Evidence Gating Step (Rule D-1)
-            confidence, should_refuse, refusal_msg = evaluator.evaluate(
-                query=query_text,
-                candidates=candidates,
-                threshold=0.35,
-            )
-
-            # C. Generation / Synthesis Step
-            t_g_start = perf_counter()
-            if should_refuse:
-                answer = refusal_msg
-                g_ms = 0.0
-                retained_sources = []
-            else:
-                context_str, retained_sources = prune_and_format_context(query_text, candidates)
-                top_src = retained_sources[0] if retained_sources else None
-                if top_src:
-                    answer = (
-                        f"Based on technical specifications: {top_src.content[:180].strip()}... "
-                        f"[Doc: {top_src.filename}, Page: {top_src.page_number}, Chunk: {top_src.id}]"
-                    )
-                else:
-                    answer = REFUSAL_MESSAGE
-                g_ms = (perf_counter() - t_g_start) * 1000.0
+            should_refuse, confidence, answer = result.refusal_triggered, result.confidence, result.answer
+            retained_sources = result.sources
+            candidates = [SearchResultItem(
+                chunk_id=source.id, document_id=source.document_id or "", filename=source.filename or "",
+                page_number=source.page_number or 1, score=source.score or 0, content=source.content or "",
+                dense_score=source.dense_score, sparse_score=source.sparse_score,
+                rerank_score=source.rerank_score,
+            ) for source in retained_sources]
+            generation_backends.add(result.generation_backend)
+            reranker_backends.add(get_reranker(settings.reranker_model).backend)
 
             generation_latencies.append(g_ms)
             tot_ms = (perf_counter() - t_q_start) * 1000.0
@@ -561,7 +498,23 @@ async def run_benchmark():
     rejection_rate = (traps_rejected / max(1, total_trap_queries)) * 100.0
 
     metrics_summary = {
-        "benchmark_timestamp": "2026-10-03T16:00:00Z",
+        "benchmark_timestamp": datetime.now(timezone.utc).isoformat(),
+        "generation_backends": sorted(generation_backends),
+        "reranker_backends": sorted(reranker_backends),
+        "measurement_scope": "Direct application handlers with real ingestion/retrieval/rerank/gating/history; excludes HTTP/auth/network overhead",
+        "quality_limitations": "Synthetic page/keyword relevance proxies; semantic faithfulness and answer relevance are NOT MEASURED",
+        "acceptance": {
+            "context_hit_proxy": threshold_status(context_recall_5, 85.0),
+            "context_precision_proxy": threshold_status(avg_precision, 80.0),
+            "negative_refusal": threshold_status(rejection_rate, 100.0),
+            "retrieval_p50": threshold_status(r_p50, 100, less_than=True),
+            "retrieval_p95": threshold_status(r_p95, 250, less_than=True),
+            "pipeline_p50": threshold_status(tot_p50, 1500, less_than=True),
+            "faithfulness": "NOT MEASURED",
+            "answer_relevance": "NOT MEASURED",
+        },
+        "backend_release_gate": "INCOMPLETE",
+        "warmup": "Actual encoder and neural reranker exercised before timed queries",
         "system_name": "Forge Hub RAG System",
         "total_queries_evaluated": len(query_results_log),
         "suites_evaluated": ["Factual (8)", "Multi-Chunk (8)", "Out-of-Domain Traps (8)"],
@@ -604,19 +557,23 @@ async def run_benchmark():
     }
 
     # 4. Emit Artifacts (Rule E-4)
-    print("\n[4/4] Generating benchmark artifacts in repository root...")
-    json_path = REPO_ROOT / "benchmark_results.json"
+    print("\n[4/4] Generating diagnostic artifacts in the selected output directory...")
+    json_path = output_dir / "benchmark_results.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(metrics_summary, f, indent=2)
     print(f"      - Saved: {json_path}")
 
-    report_path = REPO_ROOT / "benchmark_report.md"
+    report_path = output_dir / "benchmark_report.md"
     report_content = f"""# Forge Hub RAG System — Empirical Benchmark Report
 
 > **Evaluation Harness:** `scripts/benchmark_rag.py`  
 > **Target System:** Forge Hub RAG System (Two-Stage Hybrid Dense+BM25 with RRF & Evidence Gate)  
 > **Evaluation Date:** {metrics_summary['benchmark_timestamp']}  
-> **Compliance:** Rules E-1, E-2, E-3, E-4  
+> **Scope:** {metrics_summary['measurement_scope']}
+>
+> **Generation:** {', '.join(metrics_summary['generation_backends'])}; reranker: {', '.join(metrics_summary['reranker_backends'])}
+>
+> **Limit:** {metrics_summary['quality_limitations']}
 
 ---
 
@@ -624,12 +581,12 @@ async def run_benchmark():
 
 | Evaluation Dimension | Metric Target | Empirical Result | Status |
 | :--- | :--- | :--- | :--- |
-| **Retrieval Recall@5** | $\\ge 90.0\\%$ | **{context_recall_5:.1f}%** ({recall_hits}/{total_factual_queries}) |  PASS |
-| **Context Precision** | $\\ge 70.0\\%$ | **{avg_precision:.1f}%** |  PASS |
-| **Hallucination Rejection Rate** | $\\ge 87.5\\%$ | **{rejection_rate:.1f}%** ({traps_rejected}/{total_trap_queries}) |  PASS |
-| **Retrieval Latency ($p50$)** | $< 100$ ms | **{r_p50:.2f} ms** |  PASS |
-| **Retrieval Latency ($p95$)** | $< 250$ ms | **{r_p95:.2f} ms** |  PASS |
-| **End-to-End Latency ($p50$)** | $< 1500$ ms | **{tot_p50:.2f} ms** |  PASS |
+| **Admitted-context hit proxy** | $\\ge 85.0\\%$ | **{context_recall_5:.1f}%** ({recall_hits}/{total_factual_queries}) | {threshold_status(context_recall_5, 85.0)} |
+| **Context Precision** | $\\ge 80.0\\%$ | **{avg_precision:.1f}%** | {threshold_status(avg_precision, 80.0)} |
+| **Hallucination Rejection Rate** | $\\ge 100.0\\%$ | **{rejection_rate:.1f}%** ({traps_rejected}/{total_trap_queries}) | {threshold_status(rejection_rate, 100.0)} |
+| **Retrieval Latency ($p50$)** | $< 100$ ms | **{r_p50:.2f} ms** | {threshold_status(r_p50, 100, less_than=True)} |
+| **Retrieval Latency ($p95$)** | $< 250$ ms | **{r_p95:.2f} ms** | {threshold_status(r_p95, 250, less_than=True)} |
+| **End-to-End Latency ($p50$)** | $< 1500$ ms | **{tot_p50:.2f} ms** | {threshold_status(tot_p50, 1500, less_than=True)} |
 
 ---
 
@@ -649,9 +606,9 @@ Measured empirically across all 24 evaluation queries ($N=24$):
 
 | Benchmark Metric | Definition | Value | Benchmark Assessment |
 | :--- | :--- | :--- | :--- |
-| **Context Recall@5** | $\\frac{{\\text{{Relevant Hits}}}}{{\\text{{Total Queries}}}}$ in top 5 candidate chunks | **{context_recall_5:.1f}%** | Comprehensive multi-chunk recall across both vector and lexical spaces. |
-| **Context Precision** | $\\frac{{\\text{{Relevant Chunks in Top 5}}}}{{5}}$ averaged across queries | **{avg_precision:.1f}%** | RRF eliminates noise candidates from single-modality rankers. |
-| **Hallucination Rejection Rate** | Proportion of out-of-domain queries successfully refused by Gate | **{rejection_rate:.1f}%** | 100% rejection of adversarial and out-of-domain traps without hallucination. |
+| **Context Recall@5** | $\\frac{{\\text{{Relevant Hits}}}}{{\\text{{Total Queries}}}}$ in top 5 candidate chunks | **{context_recall_5:.1f}%** | Hit proxy over admitted answer context, not all retrieval candidates. |
+| **Context Precision** | $\\frac{{\\text{{Relevant Chunks in Top 5}}}}{{5}}$ averaged across queries | **{avg_precision:.1f}%** | Measured page/keyword proxy on this synthetic sample only. |
+| **Hallucination Rejection Rate** | Proportion of out-of-domain queries successfully refused by Gate | **{rejection_rate:.1f}%** | Observed refusal rate on the supplied negative cases; not universal hallucination assurance. |
 
 ---
 
@@ -689,7 +646,7 @@ Measured empirically across all 24 evaluation queries ($N=24$):
 
     # Also save the generated benchmark PDF for reference
     pdf_bytes = generate_benchmark_pdf(TECHNICAL_PAGES)
-    pdf_path = REPO_ROOT / "scripts" / "sample_technical_benchmark.pdf"
+    pdf_path = output_dir / "sample_technical_benchmark.pdf"
     with open(pdf_path, "wb") as f:
         f.write(pdf_bytes)
     print(f"      - Saved sample PDF: {pdf_path}")
@@ -698,6 +655,66 @@ Measured empirically across all 24 evaluation queries ($N=24$):
     print(f" Benchmark Complete! Recall@5: {context_recall_5:.1f}% | Rejection Rate: {rejection_rate:.1f}% | p50: {r_p50:.2f}ms")
     print("================================================================================")
 
+    return metrics_summary
+
+
+def validate_test_database(dsn):
+    url = urlsplit(dsn)
+    if not (url.scheme in {"postgres", "postgresql"} and url.hostname in {"127.0.0.1", "localhost", "::1"}
+            and re.fullmatch(r"forge_hub_test(?:_[A-Za-z0-9_]+)?", unquote(url.path.lstrip("/")))
+            and not url.query and not url.fragment):
+        raise ValueError("Use a separate loopback disposable forge_hub_test database; application DSNs are never used")
+    return dsn
+
+
+async def isolated_benchmark(args):
+    import asyncpg
+    import app.db as database
+    import app.documents as documents
+    import app.sessions as sessions
+    import app.embeddings as embeddings
+    dsn = validate_test_database(args.database_url)
+    output = Path(args.output_dir).resolve() if args.output_dir else Path(tempfile.mkdtemp(prefix="forge-hub-evaluation-"))
+    output.mkdir(parents=True, exist_ok=True)
+    settings = Settings(_env_file=None, database_url=dsn, vector_db_url=None, storage_mode="postgres",
+                        openrouter_api_key=None, gemini_api_key=None)
+    schema = "forge_hub_eval_" + uuid.uuid4().hex
+    connection, pool = None, None
+    try:
+        connection = await asyncpg.connect(dsn, timeout=10)
+        await connection.execute('CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public')
+        await connection.execute('CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public')
+        await connection.execute('CREATE SCHEMA "' + schema + '"')
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=10,
+                                        server_settings={"search_path": '"' + schema + '",public'})
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(database, "_pool", pool))
+            stack.enter_context(patch.object(database, "_use_memory_fallback", False))
+            for module in (database, documents, sessions, embeddings):
+                stack.enter_context(patch.object(module, "get_settings", lambda: settings))
+            await database.ensure_schema()
+            from app.model_readiness import warmup_models
+            await warmup_models(settings)
+            result = await run_benchmark(settings, "benchmark-" + uuid.uuid4().hex, output)
+        print("Diagnostic results:", output)
+        return 2 if "FAIL" in result["acceptance"].values() else 0
+    finally:
+        if pool is not None:
+            await pool.close()
+        if connection is not None:
+            # The target is generated here, never supplied by the caller.
+            if re.fullmatch(r"forge_hub_eval_[0-9a-f]{32}", schema):
+                await connection.execute('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE')
+            await connection.close()
+
 
 if __name__ == "__main__":
-    asyncio.run(run_benchmark())
+    parser = argparse.ArgumentParser(description="Isolated application-pipeline diagnostic; does not certify RAG triad quality")
+    parser.add_argument("--database-url", default=os.environ.get("FORGE_HUB_TEST_DATABASE_URL", ""), help="Explicit disposable loopback test database only")
+    parser.add_argument("--output-dir", help="Results directory; defaults to a new temporary directory")
+    args = parser.parse_args()
+    try:
+        validate_test_database(args.database_url)
+    except ValueError as error:
+        parser.error(str(error))
+    raise SystemExit(asyncio.run(isolated_benchmark(args)))

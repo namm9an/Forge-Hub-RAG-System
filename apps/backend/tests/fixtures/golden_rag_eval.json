@@ -1,0 +1,142 @@
+{
+  "pages": [
+    "Alder journal and crash recovery. The primary acknowledges a write only after its journal record reaches durable storage. A crash may lose its in-memory index, so recovery replays journal entries after the most recent durable checkpoint. Each journal record carries a length and a checksum. A bad checksum at the end of the journal raises JRNL_BAD_TAIL and stops replay before the incomplete record. Recovery leaves previously verified records intact.",
+    "Alder checkpoint publication. The checkpoint worker starts a new checkpoint when dirty pages exceed 420 megabytes, regardless of their age. The worker stages the manifest beside its destination on the same filesystem. It syncs the checkpoint files before atomically renaming the manifest into place. Readers keep the old checkpoint generation until publication finishes.",
+    "Birch approximate vector search. Birch sets the HNSW construction width to 96 candidates. Each lookup starts with a search width of 48 candidates. A graph rebuild catches up with queued changes before it replaces the active graph. The active graph remains searchable while the rebuild runs. For two normalized embeddings, a larger dot product means a closer match.",
+    "Cedar evidence ranking. Cedar's sparse branch matches rare field names such as ARCHIVE_REF_V2 through its lexical index. Its dense branch ranks conceptually related passages even when they use different wording. Rank fusion divides each branch weight by 55 plus the result rank. The dense branch has weight 0.65 and the sparse branch has weight 0.35. Cedar combines rank positions because the branches do not share a score scale.",
+    "Drift replica coordination. Drift draws each election timeout between 220 and 400 milliseconds to stagger campaigns. A new election increases the term, and replicas discard heartbeats from an older term. In its five-replica deployment, Drift commits a log entry when three replicas including the leader have stored it durably. A follower that loses connectivity keeps its local log but cannot advance the commit point alone.",
+    "Ember buffer cache. Pages brought in by a sequential scan enter the probationary queue rather than the protected queue. A later independent lookup can promote a page to the protected queue. Ember writes a dirty page to storage before evicting it. Eviction can discard a clean page without a write. When memory is tight, Ember selects a victim from the probationary queue first.",
+    "Finch delivery outbox. The outbox worker transmits an event only after the transaction that created it commits. Retries reuse the same batch key so the consumer can recognize a duplicate. A failed delivery waits 2 seconds before its first retry and doubles the delay up to 32 seconds. The worker records successful delivery separately from the transaction that created the event.",
+    "Grove request telemetry. Grove derives the fleet p95 from the combined request histogram buckets instead of averaging worker percentiles. Streaming time to first token starts at request admission and ends when the first answer token is sent. An initial metadata event does not stop that clock. A stream counts as complete only after the answer is saved and the completion event is sent."
+  ],
+  "cases": [
+    {
+      "id": "eval_001",
+      "query": "What must happen before an Alder client receives confirmation of a write?",
+      "facts": [{"page": 1, "text": "acknowledges a write only after its journal record reaches durable storage"}]
+    },
+    {
+      "id": "eval_002",
+      "query": "Where does Alder begin replaying changes after a crash?",
+      "facts": [{"page": 1, "text": "replays journal entries after the most recent durable checkpoint"}]
+    },
+    {
+      "id": "eval_003",
+      "query": "What journal condition does JRNL_BAD_TAIL report, and what happens to replay?",
+      "facts": [{"page": 1, "text": "A bad checksum at the end of the journal raises JRNL_BAD_TAIL and stops replay before the incomplete record"}]
+    },
+    {
+      "id": "eval_004",
+      "query": "What dirty-page volume starts an Alder checkpoint even when the pages are new?",
+      "facts": [{"page": 2, "text": "starts a new checkpoint when dirty pages exceed 420 megabytes, regardless of their age"}]
+    },
+    {
+      "id": "eval_005",
+      "query": "What file operation publishes an Alder checkpoint, and when does it happen?",
+      "facts": [{"page": 2, "text": "syncs the checkpoint files before atomically renaming the manifest into place"}]
+    },
+    {
+      "id": "eval_006",
+      "query": "How does Alder publish a checkpoint and choose where journal recovery resumes?",
+      "facts": [
+        {"page": 1, "text": "replays journal entries after the most recent durable checkpoint"},
+        {"page": 2, "text": "syncs the checkpoint files before atomically renaming the manifest into place"}
+      ]
+    },
+    {
+      "id": "eval_007",
+      "query": "Compare Birch's candidate widths when it builds the HNSW graph and when it looks up a vector.",
+      "facts": [
+        {"page": 3, "text": "sets the HNSW construction width to 96 candidates"},
+        {"page": 3, "text": "Each lookup starts with a search width of 48 candidates"}
+      ]
+    },
+    {
+      "id": "eval_008",
+      "query": "What does Birch have to finish before swapping in a rebuilt graph?",
+      "facts": [{"page": 3, "text": "A graph rebuild catches up with queued changes before it replaces the active graph"}]
+    },
+    {
+      "id": "eval_009",
+      "query": "For Birch unit-length embeddings, does a higher dot product indicate a nearer or farther neighbor?",
+      "facts": [{"page": 3, "text": "For two normalized embeddings, a larger dot product means a closer match"}]
+    },
+    {
+      "id": "eval_010",
+      "query": "Which Cedar retrieval branch can find the exact field ARCHIVE_REF_V2?",
+      "facts": [{"page": 4, "text": "sparse branch matches rare field names such as ARCHIVE_REF_V2 through its lexical index"}]
+    },
+    {
+      "id": "eval_011",
+      "query": "Give Cedar's rank-fusion denominator and both branch weights.",
+      "facts": [
+        {"page": 4, "text": "Rank fusion divides each branch weight by 55 plus the result rank"},
+        {"page": 4, "text": "The dense branch has weight 0.65 and the sparse branch has weight 0.35"}
+      ]
+    },
+    {
+      "id": "eval_012",
+      "query": "How many graph candidates does Birch start a lookup with, and what weights does Cedar use for its dense and sparse rankings?",
+      "facts": [
+        {"page": 3, "text": "Each lookup starts with a search width of 48 candidates"},
+        {"page": 4, "text": "The dense branch has weight 0.65 and the sparse branch has weight 0.35"}
+      ]
+    },
+    {
+      "id": "eval_013",
+      "query": "How does Drift keep replica campaigns from starting together, and what is the timeout range?",
+      "facts": [{"page": 5, "text": "draws each election timeout between 220 and 400 milliseconds to stagger campaigns"}]
+    },
+    {
+      "id": "eval_014",
+      "query": "How many Drift replicas must save an entry before commit, and does that count include the leader?",
+      "facts": [{"page": 5, "text": "Drift commits a log entry when three replicas including the leader have stored it durably"}]
+    },
+    {
+      "id": "eval_015",
+      "query": "Where does Ember place pages brought in by a long one-pass scan?",
+      "facts": [{"page": 6, "text": "Pages brought in by a sequential scan enter the probationary queue rather than the protected queue"}]
+    },
+    {
+      "id": "eval_016",
+      "query": "What must happen before Ember evicts a modified page and before Finch can send an outbox event?",
+      "facts": [
+        {"page": 6, "text": "Ember writes a dirty page to storage before evicting it"},
+        {"page": 7, "text": "The outbox worker transmits an event only after the transaction that created it commits"}
+      ]
+    },
+    {
+      "id": "eval_017",
+      "query": "How does Finch let a consumer tell a retried delivery from a new one?",
+      "facts": [{"page": 7, "text": "Retries reuse the same batch key so the consumer can recognize a duplicate"}]
+    },
+    {
+      "id": "eval_018",
+      "query": "What backoff schedule does Finch follow after an event fails to send?",
+      "facts": [{"page": 7, "text": "A failed delivery waits 2 seconds before its first retry and doubles the delay up to 32 seconds"}]
+    },
+    {
+      "id": "eval_019",
+      "query": "How does Grove compute the 95th-percentile latency for the whole fleet?",
+      "facts": [{"page": 8, "text": "derives the fleet p95 from the combined request histogram buckets instead of averaging worker percentiles"}]
+    },
+    {
+      "id": "eval_020",
+      "query": "How does Finch record delivery success relative to the originating transaction, and when does Grove classify an answer stream as complete?",
+      "facts": [
+        {"page": 7, "text": "The worker records successful delivery separately from the transaction that created the event"},
+        {"page": 8, "text": "A stream counts as complete only after the answer is saved and the completion event is sent"}
+      ]
+    },
+    {"id": "eval_021", "query": "How long should chickpeas soak before making hummus?", "facts": []},
+    {"id": "eval_022", "query": "Which composer wrote The Four Seasons?", "facts": []},
+    {"id": "eval_023", "query": "How many players start on a regulation ice hockey team?", "facts": []},
+    {"id": "eval_024", "query": "Which planet is closest to the Sun?", "facts": []},
+    {"id": "eval_025", "query": "Which encryption algorithm protects Alder's journal records at rest?", "facts": []},
+    {"id": "eval_026", "query": "What minimum Recall@5 does Birch guarantee at a search width of 48 candidates?", "facts": []},
+    {"id": "eval_027", "query": "Which minimum document age does Cedar's rank fusion enforce before it returns a result?", "facts": []},
+    {"id": "eval_028", "query": "How long can a disconnected Drift follower keep an active read lease?", "facts": []},
+    {"id": "eval_029", "query": "Which broker topic receives events from the Finch outbox?", "facts": []},
+    {"id": "eval_030", "query": "How many days does Grove retain old latency histogram buckets?", "facts": []}
+  ]
+}
