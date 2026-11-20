@@ -1,6 +1,7 @@
 from bisect import bisect_right
 import hashlib
 import io
+import math
 import re
 import unicodedata
 from typing import List, Optional, Tuple
@@ -94,6 +95,50 @@ def recursive_token_chunk(text: str, max_tokens: int = 350, overlap_tokens: int 
     return chunks
 
 
+def _full_ruled_table(table):
+    left, top, right, bottom = table.bbox
+    cell_area = sum((x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in table.cells)
+    return (len(table.rows) >= 2 and len(table.columns) >= 2
+            and math.isclose(cell_area, (right - left) * (bottom - top)))
+
+
+def _extract_page_text(page):
+    # shortcut: handle clearly ruled tables with bounded geometry; review
+    # layout detection separately for borderless or drawing-heavy pages.
+    if not 4 <= len(page.edges) <= 256:
+        return page.extract_text(use_text_flow=True) or ""
+    tables = [table for table in page.find_tables() if _full_ruled_table(table)]
+    if not tables:
+        return page.extract_text(use_text_flow=True) or ""
+
+    def table_index(char):
+        x = (char["x0"] + char["x1"]) / 2
+        y = (char["top"] + char["bottom"]) / 2
+        return next((index for index, (left, top, right, bottom) in enumerate(boxes)
+                     if left <= x < right and top <= y < bottom), None)
+
+    boxes = [table.bbox for table in tables]
+    blocks, prose, emitted = [], [], set()
+    for char in page.chars:
+        index = table_index(char)
+        if index is None:
+            prose.append(char)
+        elif index not in emitted:
+            if prose:
+                blocks.append(pdfplumber.utils.extract_text(prose, use_text_flow=True))
+                prose.clear()
+            for row in tables[index].extract():
+                cells = [" ".join(cell.split()) if cell else "" for cell in row]
+                while cells and not cells[-1]:
+                    cells.pop()
+                if cells:
+                    blocks.append(" | ".join(cells))
+            emitted.add(index)
+    if prose:
+        blocks.append(pdfplumber.utils.extract_text(prose, use_text_flow=True))
+    return "\n".join(block for block in blocks if block)
+
+
 def _extract_pdf(file_bytes: bytes, settings: Settings):
     max_pages = getattr(settings, "max_pages_per_document", 500)
     max_chars = getattr(settings, "max_extracted_chars", 2_000_000)
@@ -113,7 +158,7 @@ def _extract_pdf(file_bytes: bytes, settings: Settings):
 
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            result = collect(pdf.pages, lambda page: page.extract_text(use_text_flow=True))
+            result = collect(pdf.pages, _extract_page_text)
             if result[0]:
                 return result
     except HTTPException:

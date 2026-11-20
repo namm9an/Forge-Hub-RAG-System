@@ -1,84 +1,53 @@
-# Database Setup Instructions
+# Database setup
 
-## Prerequisites
-- PostgreSQL 14+ with pgvector extension support
-- psql command-line tool
-- Database connection URL
+Use PostgreSQL 16 with `pgvector` and `pgcrypto`, Python 3.12 with the backend dependencies, and
+`psql` for permission provisioning and the database smoke check. See the [backend setup](../apps/backend/README.md)
+for the dependency lock and model readiness requirements.
 
-## Setup Steps
+## Apply migrations
 
-### 1. Set Database URL
-```bash
-# Linux/Mac
-export VECTOR_DB_URL="postgresql://username:password@localhost:5432/ragdb"
+For local development, set `FORGE_HUB_POSTGRES_PASSWORD` privately before running `docker compose up -d postgres`
+from the repository root. The loopback database is `forge_hub`. Compose runs `bootstrap.sql` only when it
+initializes an empty data directory. Run the versioned migrator even on a fresh Compose database to
+record the expected migrations. Startup migrations default to off and production requires them off.
 
-# Windows PowerShell
-$env:VECTOR_DB_URL = "postgresql://username:password@localhost:5432/ragdb"
-```
+Before upgrading an existing database, confirm the target, review the migration files and verify a
+backup and restore procedure. Set `VECTOR_DB_URL` to the migration connection in your operator
+environment. This identity needs the privileges to create or upgrade the application objects and
+install the two extensions if they are absent. The connection's search path must select the
+application schema first and include the schemas that provide the extensions.
 
-### 2. Run Bootstrap Script
-```bash
-psql $VECTOR_DB_URL -f scripts/bootstrap.sql
-```
+From the repository root, using the backend environment:
 
-### 3. Validate Setup
-```bash
-psql $VECTOR_DB_URL -f scripts/validate_db.sql
-```
-
-Expected output:
-- UUID generation test should return a valid UUID
-- Vector test should return '[(0)]'
-- Both extensions should be listed
-- All 5 tables should be created
-- Test session should be created and deleted
-- Final status should show "Database validation successful!"
-
-### 4. Alternative: Use Python Script
-If psql is not available, the database is also bootstrapped automatically when the backend starts:
-
-```bash
+```sh
 cd apps/backend
-python -m uvicorn app.main:create_app --factory --reload
+python -m app.migrate --apply
 ```
 
-The `ensure_schema()` function in `app/db.py` will run on startup.
+The migrator applies and records the versions in one transaction. After a failure, fix the cause
+before retrying. Reverting a successfully applied data migration requires the reviewed restore plan.
 
-## Troubleshooting
+## Provision and verify the runtime login
 
-### pgvector not found
-If you get an error about pgvector extension not found:
-1. Install pgvector: https://github.com/pgvector/pgvector#installation
-2. Or use Supabase/Neon which have pgvector pre-installed
+For production, use an operator authorized to manage roles and grant privileges on the migrated
+schema. With `OPERATOR_DSN` set privately, run from the repository root:
 
-### pgcrypto not found
-This is a standard PostgreSQL extension and should be available. If not:
-```sql
--- Check available extensions
-SELECT * FROM pg_available_extensions WHERE name = 'pgcrypto';
+```sh
+psql "$OPERATOR_DSN" -X -v ON_ERROR_STOP=1 -f scripts/runtime_role.sql
 ```
 
-### Connection refused
-- Check PostgreSQL is running
-- Verify connection string format
-- Check firewall/network settings
+The script provisions the `forge_hub_runtime` permission role. As the operator, grant that role to
+a dedicated non-owner login that inherits its privileges. The login needs its own credential,
+access to the database, and the same application schema search path. Keep it out of owner and
+privileged roles. Configure the backend with this login's connection and `RUN_MIGRATIONS=false`.
 
-## Testing the Extensions
+Set `RUNTIME_DSN` privately to the connection the backend will use. For local development it can
+reference the local Compose login.
 
-### Test pgcrypto:
-```sql
-SELECT gen_random_uuid();
+```sh
+psql "$RUNTIME_DSN" -X -v ON_ERROR_STOP=1 -f scripts/validate_db.sql
 ```
 
-### Test vector:
-```sql
-SELECT '[(0,1,2)]'::vector;
-SELECT '[(0.1, 0.2, 0.3)]'::vector(3);
-```
-
-### Test vector similarity:
-```sql
-SELECT 1 - (
-  '[(1,0,0)]'::vector <=> '[(0,1,0)]'::vector
-) AS cosine_similarity;
-```
+The read-only check requires both extensions, all application tables in the active schema, and the
+expected migration records. After starting the backend, use `/ready` to confirm runtime permission
+checks in production, PostgreSQL connectivity and model readiness.

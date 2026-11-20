@@ -15,6 +15,8 @@ from .sessions import router as sessions_router
 from .db import get_pool, close_pool, ensure_schema, check_schema, check_runtime_privileges, cleanup_expired_sessions, owner_stats
 from .schemas import StatsResponse
 from .middleware import RequestLimits
+from .model_readiness import warmup_models
+from .gating import get_reranker
 
 
 def create_app() -> FastAPI:
@@ -39,9 +41,12 @@ def create_app() -> FastAPI:
                 await check_schema()
             if settings.environment == "production":
                 await check_runtime_privileges()
+            await warmup_models(settings)
+            app.state.models_ready = True
             worker = asyncio.create_task(maintenance())
             yield
         finally:
+            app.state.models_ready = False
             if worker is not None:
                 worker.cancel()
                 with suppress(asyncio.CancelledError):
@@ -49,6 +54,7 @@ def create_app() -> FastAPI:
             await close_pool()
 
     app = FastAPI(title="Forge Hub RAG System", version="1.0.0", lifespan=lifespan)
+    app.state.models_ready = False
 
     # CORS
     app.add_middleware(
@@ -71,6 +77,8 @@ def create_app() -> FastAPI:
     async def readiness():
         try:
             validate_auth_configuration(get_settings())
+            if not app.state.models_ready or get_reranker(settings.reranker_model).backend != "flashrank":
+                return JSONResponse({"status": "unavailable"}, status_code=503)
             if settings.environment == "production":
                 await check_runtime_privileges()
             pool = await get_pool()
