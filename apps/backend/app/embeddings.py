@@ -1,6 +1,8 @@
 import asyncio
+from collections import OrderedDict
 from contextlib import ExitStack
 from functools import partial
+from itertools import chain
 import threading
 from typing import List, Optional
 import weakref
@@ -19,6 +21,8 @@ router = APIRouter(prefix="/api/embeddings", tags=["embeddings"])
 _model: Optional[SentenceTransformer] = None
 _model_lock = threading.Lock()
 _work_limits = weakref.WeakKeyDictionary()
+_reranking_limits = weakref.WeakKeyDictionary()
+_query_batchers = weakref.WeakKeyDictionary()
 
 
 def _blocking_workers():
@@ -34,9 +38,13 @@ def _work_limit(limits, loop, capacity):
     return limiter
 
 
-async def _run_blocking(prepare):
+async def _run_blocking(prepare, *, reranking=False):
     loop = asyncio.get_running_loop()
     with ExitStack() as acquired:
+        if reranking:
+            lane = _work_limit(_reranking_limits, loop, 1)
+            await lane.acquire()
+            acquired.callback(lane.release)
         limiter = _work_limit(_work_limits, loop, _blocking_workers())
         await limiter.acquire()
         acquired.callback(limiter.release)
@@ -61,7 +69,8 @@ async def run_blocking(function, *args, **kwargs):
 
 
 async def run_reranking(function, *args, **kwargs):
-    return await run_blocking(function, *args, **kwargs)
+    """Wait for the serial ranker before reserving any shared CPU capacity."""
+    return await _run_blocking(lambda: partial(function, *args, **kwargs), reranking=True)
 
 
 def get_model(settings) -> SentenceTransformer:
@@ -75,7 +84,8 @@ def get_model(settings) -> SentenceTransformer:
 
 
 async def get_model_async(settings) -> SentenceTransformer:
-    return await run_blocking(get_model, settings)
+    model = _model
+    return model if model is not None else await run_blocking(get_model, settings)
 
 
 def _as_pgvector(vec: List[float]) -> str:
@@ -102,8 +112,77 @@ async def _embed_texts(model: SentenceTransformer, texts: List[str], batch_size:
     return await run_blocking(_encode_texts, model, texts, batch_size) if texts else []
 
 
+class _QueryBatcher:
+    """Pack waiting queries into bounded CPU calls without caching query data."""
+
+    def __init__(self, model):
+        self.model = model
+        self.pending = OrderedDict()
+        self.workers = set()
+
+    async def encode(self, query):
+        loop = asyncio.get_running_loop()
+        result = loop.create_future()
+        self.pending[result] = query
+        if len(self.workers) < _blocking_workers():
+            worker = loop.create_task(self.drain())
+            self.workers.add(worker)
+        try:
+            return await result
+        finally:
+            self.pending.pop(result, None)
+
+    async def drain(self):
+        batch = []
+        try:
+            while self.pending:
+                batch = []
+                while self.pending and len(batch) < 8:
+                    result, query = self.pending.popitem(last=False)
+                    if not result.done():
+                        batch.append((query, result))
+                if batch:
+                    await self.resolve(batch)
+        except asyncio.CancelledError:
+            for result in chain((result for _, result in batch), self.pending):
+                result.cancel()
+            self.pending.clear()
+            raise
+        finally:
+            self.workers.discard(asyncio.current_task())
+
+    async def resolve(self, batch):
+        def prepare():
+            # The batch can lose all its clients while it waits for a CPU slot.
+            batch[:] = [(query, result) for query, result in batch if not result.done()]
+            if batch:
+                return partial(_encode_texts, self.model, [query for query, _ in batch])
+            return None
+
+        try:
+            vectors = await _run_blocking(prepare)
+        except Exception as error:
+            if len(batch) > 1:
+                # Preserve independent request outcomes when one input or the larger batch fails.
+                for query, result in batch:
+                    if not result.done():
+                        await self.resolve([(query, result)])
+            elif not batch[0][1].done():
+                batch[0][1].set_exception(error)
+            return
+        if vectors is None:
+            return
+        for (_, result), vector in zip(batch, vectors):
+            if not result.done():
+                result.set_result(vector)
+
+
 async def embed_query(model: SentenceTransformer, query: str) -> List[float]:
-    return (await _embed_texts(model, [query]))[0]
+    loop = asyncio.get_running_loop()
+    batcher = _query_batchers.get(loop)
+    if batcher is None or batcher.model is not model:
+        batcher = _query_batchers[loop] = _QueryBatcher(model)
+    return await batcher.encode(query)
 
 
 @router.post("/generate")
