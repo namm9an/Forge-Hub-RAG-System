@@ -140,8 +140,16 @@ def _local_synthesize_grounded(sources: List[Source], max_chars: int = 16000) ->
 
 
 def provider_connection(settings):
-    key = getattr(settings, "openrouter_api_key", None)
-    return "https://openrouter.ai/api/v1", key.get_secret_value() if hasattr(key, "get_secret_value") else key
+    provider = getattr(settings, "llm_provider", "openrouter")
+    if provider == "gemini":
+        base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+        key = getattr(settings, "gemini_api_key", None)
+    elif provider == "openrouter":
+        base_url = "https://openrouter.ai/api/v1"
+        key = getattr(settings, "openrouter_api_key", None)
+    else:
+        raise ValueError("Unsupported LLM provider")
+    return base_url, key.get_secret_value() if hasattr(key, "get_secret_value") else key
 
 
 async def _llm_complete_openrouter(
@@ -274,7 +282,7 @@ async def _rerank_for_chat(reranker, settings, **kwargs):
         raise HTTPException(status_code=503, detail="Neural retrieval is unavailable") from error
 
 
-async def _focus_candidates(query, candidates, settings, reranker, threshold):
+async def _focus_candidates(query, candidates, settings, reranker, threshold, *, question=None):
     """Use independently supported sentence windows or the original supported chunk."""
     parents = [dict(c) if isinstance(c, dict) else c.model_dump() for c in candidates]
     sentences = [split_into_sentences(c["content"]) for c in parents]
@@ -292,13 +300,13 @@ async def _focus_candidates(query, candidates, settings, reranker, threshold):
     for start in range(0, len(windows), 16):
         ranked = await _rerank_for_chat(reranker, settings, query=query, candidates=windows[start:start + 16])
         for window in ranked:
-            if not evaluator.evaluate(query, [window], threshold)[1]:
+            if not evaluator.evaluate(query, [window], threshold, question=question, require_all_metrics=False)[1]:
                 admitted.setdefault(window["parent"], []).append(window)
     focused = []
     for parent, original in enumerate(parents):
         spans = admitted.get(parent)
         if not spans:
-            if not evaluator.evaluate(query, [original], threshold)[1]:
+            if not evaluator.evaluate(query, [original], threshold, question=question, require_all_metrics=False)[1]:
                 focused.append(original)
             continue
         indexes = {index for window in spans for index in (window["start"], window["start"] + 1)}
@@ -329,12 +337,12 @@ async def _prepare_evidence(req: ChatRequest, settings: Settings, principal: Pri
         reranker, settings, query=search_query, candidates=candidates, top_k=req.top_k or settings.top_k_results,
     )
     candidates = await _focus_candidates(
-        search_query, candidates, settings, reranker, req.threshold,
+        search_query, candidates, settings, reranker, req.threshold, question=req.query,
     )
     retrieval_ms = int((perf_counter() - retrieval_started) * 1000)
     context, sources = prune_and_format_context(search_query, candidates, max_context_chars=settings.max_context_chars)
     confidence, refuse, _ = EvidenceEvaluator(settings.similarity_threshold).evaluate(
-        search_query, sources, req.threshold,
+        search_query, sources, req.threshold, question=req.query,
     )
     if refuse or not sources:
         return PreparedEvidence(session_record_id, started, retrieval_ms, search_query, ConfidenceLevel.LOW, True, [], [])

@@ -16,6 +16,85 @@ from .schemas import ConfidenceLevel, SearchResultItem, Source
 
 REFUSAL_MESSAGE = "The provided documents do not contain sufficient context to answer this question."
 
+_METRIC = re.compile(r"\b[a-z][\w.-]*@\d+\b", re.I)
+_CHOICE = re.compile(r"^(?:and\s+)?(?:which|what (?:minimum|maximum))\s+(?:minimum\s+|maximum\s+)?", re.I)
+_BOUND_QUESTION = re.compile(r"\b(?:minimum|maximum|guarantee\w*|at least|at most)\b", re.I)
+_METRIC_VALUE = re.compile(
+    r"\s*(?:(?:is|was|of|equals|exceeds|(?:must|should) be)\s+|[:=]\s*)?"
+    r"(?:(?:at least|at most)\s+|[<>]=?\s*)?[+-]?\d", re.I,
+)
+_UNSPECIFIED_FIELD = re.compile(
+    r"\b(\w+)\s+(?:(?:is|was|remains)\s+)?"
+    r"(?:unspecified|undocumented|unknown|not (?:specified|documented|known|provided))\b", re.I,
+)
+_PROTOCOL = re.compile(r"\b(?:TLS|SSL|HTTPS?|SSH|TCP|UDP|QUIC|DNS|SMTP|IPsec|gRPC|AMQP|MQTT)\b", re.I)
+_TIME_UNIT = r"(?:milliseconds?|seconds?|minutes?|hours?|days?|weeks?|months?|years?)"
+_AMOUNT = r"\b(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|a|an|half)[\s-]*"
+_DURATION_QUESTION = re.compile(rf"^(?:and\s+)?how (?:long|many {_TIME_UNIT})\b", re.I)
+_DURATION = re.compile(rf"{_AMOUNT}{_TIME_UNIT}\b|\b(?:indefinitely|permanently)\b", re.I)
+_LENGTH = re.compile(
+    rf"{_AMOUNT}(?:mm|cm|km|(?:kilo)?met(?:er|re)s?|inch(?:es)?|foot|feet|yards?)\b", re.I,
+)
+_RETENTION = re.compile(r"\b(?:retain\w*|retention|keep\w*|kept|stored?|storing|expir\w*|ttl)\b", re.I)
+_QUESTION_FILLER = frozenset(
+    "a an and are can could do does have in is it its may of on should the their them they to was we were will would".split()
+)
+_DURATION_FILLER = _QUESTION_FILLER | {"take", "takes"}
+
+
+def _terms(text: str) -> set[str]:
+    words = {word.removesuffix("s") for word in re.findall(r"\w+", text.casefold())}
+    return words | {word[:-1] for word in words if word.endswith("ed")}
+
+
+def _supports_metrics(question, excerpts, requested, require_all):
+    needs_value = _BOUND_QUESTION.search(question)
+    found = {
+        metric[0].casefold()
+        for excerpt in excerpts
+        for sentence in split_into_sentences(excerpt)
+        for metric in _METRIC.finditer(sentence)
+        if not needs_value or _METRIC_VALUE.match(sentence[metric.end():])
+    }
+    return requested <= found if require_all else bool(requested & found)
+
+
+def _corroborates_question(question: str, excerpt: str) -> bool:
+    # shortcut: explicit fields and quantity cues catch missing facts, add an
+    # independently validated answerability model for unrestricted paraphrases.
+    choice = _CHOICE.match(question)
+    if choice:
+        phrase = re.findall(r"\b[^\W\d_]+\b", question[choice.end():])
+        if phrase and phrase[0].istitle() and len(phrase) > 2:
+            phrase = phrase[1:]
+        fields = _terms(" ".join(phrase[:2]))
+        if fields:
+            topic = _terms(" ".join(phrase[2:])) - _QUESTION_FILLER
+            return any(
+                not (fields & _terms(" ".join(_UNSPECIFIED_FIELD.findall(sentence))))
+                and (fields & _terms(sentence) or (
+                    "protocol" in fields and _PROTOCOL.search(sentence) and topic & _terms(sentence)
+                ))
+                for sentence in split_into_sentences(excerpt)
+            )
+
+    duration = _DURATION_QUESTION.match(question)
+    if duration:
+        words = re.findall(r"\w+", question[duration.end():].casefold())
+        anchors = _terms(" ".join(word for word in words if word not in _DURATION_FILLER))
+        retention = bool(_RETENTION.search(question))
+        if retention:
+            anchors = {word for word in anchors if not _RETENTION.fullmatch(word)}
+        allows_length = not retention and duration[0].casefold().endswith("how long")
+        return any(
+            (not anchors or anchors & _terms(sentence))
+            and (_DURATION.search(sentence) or (allows_length and _LENGTH.search(sentence)))
+            and (not retention or _RETENTION.search(sentence))
+            for sentence in split_into_sentences(excerpt)
+        )
+    return True
+
+
 class NeuralRerankUnavailable(RuntimeError):
     pass
 
@@ -240,6 +319,9 @@ class EvidenceEvaluator:
         query: str,
         candidates: List[Union[SearchResultItem, Source, Dict[str, Any]]],
         threshold: Optional[float] = None,
+        *,
+        question: Optional[str] = None,
+        require_all_metrics: bool = True,
     ) -> Tuple[ConfidenceLevel, bool, str]:
         """
         Evaluates candidate chunks against query.
@@ -276,6 +358,14 @@ class EvidenceEvaluator:
         content_q_tokens = q_tokens - stop_words or q_tokens
 
         excerpts = [(c.get("content") if isinstance(c, dict) else c.content) or "" for c in candidates]
+        question = (query if question is None else question).strip()
+        metrics = set(_METRIC.findall(question.casefold()))
+        corroborated = (
+            _supports_metrics(question, excerpts, metrics, require_all_metrics) if metrics
+            else any(_corroborates_question(question, excerpt) for excerpt in excerpts)
+        )
+        if not corroborated:
+            return ConfidenceLevel.LOW, True, REFUSAL_MESSAGE
         all_text = " ".join(excerpts).lower()
         terms_matched = len(content_q_tokens.intersection(re.findall(r"\w+", all_text)))
         term_match_ratio = terms_matched / max(1, len(content_q_tokens))

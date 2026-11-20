@@ -35,7 +35,9 @@ class Settings(BaseSettings):
     database_url: Optional[str] = Field(default=None, repr=False, description="Fallback database connection string")
 
     # LLM & Embedding Service
+    llm_provider: Literal["openrouter", "gemini"] = "openrouter"
     openrouter_api_key: Optional[SecretStr] = Field(default=None, description="OpenRouter API key for LLM generation")
+    gemini_api_key: Optional[SecretStr] = None
     embedding_api_url: Optional[str] = Field(default=None, description="Optional external embedding API URL")
     embedding_api_key: Optional[SecretStr] = Field(default=None, description="Optional external embedding API Key")
     llm_model: str = Field(default="qwen/qwen3-coder:free", description="LLM model identifier")
