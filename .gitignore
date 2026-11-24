@@ -29,9 +29,6 @@ node_modules/
 .next/
 out/
 
-# Turborepo
-.turbo/
-
 # Environment files
 .env
 .env.local

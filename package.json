@@ -4,21 +4,16 @@
   "private": true,
   "packageManager": "npm@11.20.0",
   "workspaces": [
-    "apps/*",
-    "packages/*"
+    "apps/frontend"
   ],
   "scripts": {
-    "build": "turbo build",
-    "dev": "turbo dev",
-    "lint": "turbo lint",
-    "test": "turbo test",
+    "build": "npm run build --workspace @advanced-rag/frontend --",
+    "dev": "npm run dev --workspace @advanced-rag/frontend --",
+    "lint": "npm run lint --workspace @advanced-rag/frontend --",
+    "test": "npm run test --workspace @advanced-rag/frontend --",
     "format": "prettier -w ."
   },
   "devDependencies": {
-    "eslint": "^9.0.0",
-    "prettier": "^3.2.5",
-    "turbo": "^2.0.0",
-    "typescript": "^5.5.0"
+    "prettier": "^3.2.5"
   }
 }
-

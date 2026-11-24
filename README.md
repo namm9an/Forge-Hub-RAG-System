@@ -99,14 +99,12 @@ Forge-Hub-RAG-System/
 │       ├── app/                     # React Server Components & client views
 │       ├── components/              # Modular UI components (Chat, Upload, Sources)
 │       └── package.json
-├── packages/
-│   └── common/                      # Shared types and validation contracts
 ├── scripts/
 │   ├── bootstrap.sql                # PostgreSQL 16 schema, HNSW & GIN DDL
 │   ├── validate_db.sql              # Database verification script
 │   └── benchmark_rag.py             # Reproducible latency & retrieval benchmark harness
 ├── docker-compose.yml               # PostgreSQL 16 + pgvector container definition
-├── turbo.json                       # Turborepo monorepo pipeline configuration
+├── package.json                     # npm workspace commands
 └── README.md
 ```
 

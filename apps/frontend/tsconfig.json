@@ -19,11 +19,6 @@
     "isolatedModules": true,
     "jsx": "preserve",
     "baseUrl": ".",
-    "paths": {
-      "@common/*": [
-        "../../packages/common/src/*"
-      ]
-    },
     "plugins": [
       {
         "name": "next"

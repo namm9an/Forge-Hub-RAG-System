@@ -1,8 +1,6 @@
 {
-  "extends": ["next", "turbo", "prettier"],
-  "plugins": ["unused-imports"],
-  "rules": {
-    "unused-imports/no-unused-imports": "warn"
-  }
+  "extends": "next/core-web-vitals",
+  "ignorePatterns": ["node_modules", ".next", "dist", "build"],
+  "root": true
 }
 
