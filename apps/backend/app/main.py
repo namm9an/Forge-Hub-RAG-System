@@ -57,17 +57,19 @@ def create_app() -> FastAPI:
     app.state.models_ready = False
 
     # CORS
+    allowed_origins = [origin.strip() for origin in settings.allowed_origins.split(",")]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[o.strip() for o in settings.allowed_origins.split(",")],
+        allow_origins=allowed_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Authorization", "Content-Type", "Accept", "X-Session-ID"],
+        expose_headers=["Retry-After"],
     )
     if settings.environment == "production":
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=[host.strip() for host in settings.allowed_hosts.split(",") if host.strip()])
     app.add_middleware(RequestLimits, max_body_bytes=settings.max_total_bytes + 1024 * 1024,
-                       max_inflight=settings.max_inflight_requests)
+                       max_inflight=settings.max_inflight_requests, allowed_origins=allowed_origins)
 
     @app.get("/health")
     async def health():

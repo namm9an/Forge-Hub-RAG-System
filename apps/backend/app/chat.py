@@ -43,21 +43,36 @@ def citation_tag(source: Source) -> str:
     return f"[Doc: {source.filename}, Page: {source.page_number}, Chunk: {source.id}]"
 
 
-def valid_answer_citations(answer: str, sources: List[Source]) -> bool:
-    """Validate attribution identity/format, not semantic entailment or faithfulness."""
+_CITATION_OPENERS = ("[Doc:", "\u3010Doc:")
+_CITATION_START = re.compile(r"[\[\u3010]Doc:")
+
+
+def _known_citation(text: str, start: int, allowed: set[str]) -> Optional[str]:
+    for tag in allowed:
+        end = start + len(tag)
+        if end <= len(text) and text[end - 1] in "]\u3011" and text.startswith(tag[1:-1], start + 1):
+            return tag
+    return None
+
+
+def _canonical_answer_citations(answer: str, sources: List[Source]) -> Optional[str]:
     if answer.strip() == REFUSAL_MESSAGE:
-        return True
+        return answer
     allowed = {citation_tag(source) for source in sources}
-    cursor, count = 0, 0
-    while True:
-        start = answer.find("[Doc:", cursor)
-        if start < 0:
-            return count > 0
-        end = answer.find("]", start)
-        if end < 0 or answer[start:end+1] not in allowed:
-            return False
-        count += 1
-        cursor = end + 1
+    cursor, parts = 0, []
+    while match := _CITATION_START.search(answer, cursor):
+        start = match.start()
+        tag = _known_citation(answer, start, allowed)
+        if tag is None:
+            return None
+        parts.extend((answer[cursor:start], tag))
+        cursor = start + len(tag)
+    return "".join(parts) + answer[cursor:] if parts else None
+
+
+def valid_answer_citations(answer: str, sources: List[Source]) -> bool:
+    """Accept either delimiter style with the exact supplied filename, page and chunk ID."""
+    return _canonical_answer_citations(answer, sources) is not None
 
 
 class CitationBuffer:
@@ -75,36 +90,38 @@ class CitationBuffer:
         self.size += len(token)
         if self.size > self.limit:
             raise ProviderOutputError("answer_limit_exceeded")
-        self.parts.append(token)
         self.pending += token
         ready = []
-        marker = "[Doc:"
         while self.pending:
-            start = self.pending.find(marker)
-            if start < 0:
-                keep = max((n for n in range(1, len(marker)) if self.pending.endswith(marker[:n])), default=0)
+            match = _CITATION_START.search(self.pending)
+            if match is None:
+                keep = max((n for marker in _CITATION_OPENERS for n in range(1, len(marker))
+                            if self.pending.endswith(marker[:n])), default=0)
                 ready.append(self.pending[:-keep] if keep else self.pending)
                 self.pending = self.pending[-keep:] if keep else ""
                 break
+            start = match.start()
             ready.append(self.pending[:start])
             self.pending = self.pending[start:]
-            end = self.pending.find("]")
-            if end < 0:
-                if len(self.pending) > 1024:
-                    raise ProviderOutputError("invalid_citation")
-                break
-            tag = self.pending[:end + 1]
-            if tag not in self.allowed:
+            tag = _known_citation(self.pending, 0, self.allowed)
+            if tag is None:
+                if len(self.pending) <= 1024 and any(
+                    allowed[1:-1].startswith(self.pending[1:]) for allowed in self.allowed
+                ):
+                    break
                 raise ProviderOutputError("invalid_citation")
             ready.append(tag)
-            self.pending = self.pending[end + 1:]
-        return "".join(ready)
+            self.pending = self.pending[len(tag):]
+        emitted = "".join(ready)
+        self.parts.append(emitted)
+        return emitted
 
     def finish(self) -> str:
-        answer = "".join(self.parts)
+        answer = "".join(self.parts) + self.pending
         if not valid_answer_citations(answer, self.sources):
             raise ProviderOutputError("missing_or_invalid_citation")
         remainder, self.pending = self.pending, ""
+        self.parts.append(remainder)
         return remainder
 
 
@@ -133,6 +150,7 @@ def _local_synthesize_grounded(sources: List[Source], max_chars: int = 16000) ->
     initial = len(answer)
     for source in sources:
         excerpt = (source.content or "").replace("[Doc:", "[quoted reference:")
+        excerpt = excerpt.replace("\u3010Doc:", "\u3010quoted reference:")
         passage = f"\n{excerpt} {citation_tag(source)}"
         if excerpt and len(answer) + len(passage) <= max_chars:
             answer += passage
@@ -390,7 +408,8 @@ async def chat(req: ChatRequest, settings: Settings = Depends(get_settings), pri
                 api_key, prepared.messages, settings.llm_model,
                 timeout_seconds=settings.provider_timeout_seconds, max_answer_chars=settings.max_answer_chars, base_url=base_url,
             )
-            if len(answer) > settings.max_answer_chars or not valid_answer_citations(answer, prepared.sources):
+            answer = None if len(answer) > settings.max_answer_chars else _canonical_answer_citations(answer, prepared.sources)
+            if answer is None:
                 raise ProviderOutputError("invalid_provider_answer")
             backend = "provider"
         except asyncio.CancelledError:
