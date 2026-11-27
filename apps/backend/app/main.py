@@ -79,7 +79,7 @@ def create_app() -> FastAPI:
     async def readiness():
         try:
             validate_auth_configuration(get_settings())
-            if not app.state.models_ready or get_reranker(settings.reranker_model).backend != "flashrank":
+            if not app.state.models_ready or get_reranker(settings.reranker_model, settings.reranker_max_length).backend != "flashrank":
                 return JSONResponse({"status": "unavailable"}, status_code=503)
             if settings.environment == "production":
                 await check_runtime_privileges()

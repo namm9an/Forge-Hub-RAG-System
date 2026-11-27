@@ -18,7 +18,7 @@ from .config import Settings, get_settings
 from .db import execute, fetch, transaction
 from .embeddings import run_reranking
 from .gating import EvidenceEvaluator, NeuralRerankUnavailable, REFUSAL_MESSAGE, get_reranker, prune_and_format_context, split_into_sentences
-from .retrieval import retrieve_candidates
+from .retrieval import deduplicate_ranked_candidates, retrieve_candidates
 from .schemas import ChatHistoryResponse, ChatRequest, ChatResponse, ConfidenceLevel, Source
 from .sessions import authorize_session, read_history
 
@@ -288,7 +288,7 @@ class PreparedEvidence:
 
 
 async def _perform_hybrid_retrieval(query: str, session_id: str, top_k: int, settings: Settings, *, user_id: str):
-    return await retrieve_candidates(query, session_id, settings, max(top_k * 3, 20), user_id=user_id)
+    return await retrieve_candidates(query, session_id, settings, max(top_k * 3, settings.reranker_candidate_pool), user_id=user_id)
 
 
 async def _rerank_for_chat(reranker, settings, **kwargs):
@@ -298,6 +298,11 @@ async def _rerank_for_chat(reranker, settings, **kwargs):
         return await run_reranking(reranker.rerank, **kwargs)
     except NeuralRerankUnavailable as error:
         raise HTTPException(status_code=503, detail="Neural retrieval is unavailable") from error
+
+
+async def _rank_parent_candidates(reranker, settings, *, query, candidates, top_k, session_id, user_id):
+    ranked = await _rerank_for_chat(reranker, settings, query=query, candidates=candidates)
+    return await deduplicate_ranked_candidates(ranked, top_k=top_k, session_id=session_id, user_id=user_id)
 
 
 async def _focus_candidates(query, candidates, settings, reranker, threshold, *, question=None):
@@ -350,9 +355,10 @@ async def _prepare_evidence(req: ChatRequest, settings: Settings, principal: Pri
     candidates = await _perform_hybrid_retrieval(
         search_query, req.session_id, req.top_k or settings.top_k_results, settings, user_id=principal.user_id,
     )
-    reranker = get_reranker(settings.reranker_model)
-    candidates = await _rerank_for_chat(
-        reranker, settings, query=search_query, candidates=candidates, top_k=req.top_k or settings.top_k_results,
+    reranker = get_reranker(settings.reranker_model, settings.reranker_max_length)
+    candidates = await _rank_parent_candidates(
+        reranker, settings, query=search_query, candidates=candidates,
+        top_k=req.top_k or settings.top_k_results, session_id=req.session_id, user_id=principal.user_id,
     )
     candidates = await _focus_candidates(
         search_query, candidates, settings, reranker, req.threshold, question=req.query,

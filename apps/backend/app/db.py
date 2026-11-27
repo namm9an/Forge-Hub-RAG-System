@@ -45,11 +45,14 @@ CREATE TABLE IF NOT EXISTS chunks (
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
+    heading TEXT NOT NULL DEFAULT '',
     content_hash TEXT NOT NULL,
     page_number INTEGER NOT NULL DEFAULT 1,
     page_numbers INTEGER[] NOT NULL DEFAULT '{}',
     token_count INTEGER NOT NULL DEFAULT 0,
-    content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+    content_tsv tsvector GENERATED ALWAYS AS (
+        to_tsvector('english', CASE WHEN heading = '' THEN content ELSE heading || chr(10) || content END)
+    ) STORED,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(document_id, chunk_index),
     CONSTRAINT chunks_document_hash_unique UNIQUE(document_id, content_hash)
@@ -239,6 +242,7 @@ async def ensure_schema():
         ("002_private_storage", SCHEMA_SQL),
         ("003_hash_attribution", (migration_dir / "003_hash_attribution.sql").read_text(encoding="utf-8")),
         ("004_auth_rate_limits", (migration_dir / "004_auth_rate_limits.sql").read_text(encoding="utf-8")),
+        ("005_chunk_headings", (migration_dir / "005_chunk_headings.sql").read_text(encoding="utf-8")),
     ]
     async with transaction() as connection:
         await connection.execute("SELECT pg_advisory_xact_lock(hashtext(current_schema()), 20261116)")
@@ -318,7 +322,7 @@ def _memory_insert(query, args):
         record["document_id"] = str(record["document_id"])
         if record["document_id"] not in _memory_store.documents:
             raise asyncpg.ForeignKeyViolationError("Unknown chunk document")
-        record = {"page_number": 1, "page_numbers": [], "token_count": 0, **record}
+        record = {"page_number": 1, "page_numbers": [], "token_count": 0, "heading": "", **record}
         key, target = record["id"], _memory_store.chunks
         conflict = next((c for c in target.values() if c["document_id"] == record["document_id"] and (
             c["chunk_index"] == record["chunk_index"] or c["content_hash"] == record["content_hash"]
@@ -514,7 +518,8 @@ async def fetch(query, *args):
                 and (not owner_scoped or (len(args) > 1 and args[1] is not None and _owned_document(document, args[1])))]
     if "FROM CHUNKS C" in upper and "LEFT JOIN EMBEDDINGS E" in upper:
         sid = args[0] if args else None
-        return [{"id": cid, "content": chunk["content"]} for cid, chunk in _memory_store.chunks.items()
+        return [{"id": cid, "content": chunk["content"], "heading": chunk.get("heading", "")}
+                for cid, chunk in _memory_store.chunks.items()
                 if cid not in _memory_store.embeddings and (
                     sid is None or _memory_store.documents[chunk["document_id"]]["session_id"] == sid
                 )][:2000]
@@ -550,7 +555,7 @@ async def fetch(query, *args):
                 continue
             if owner is not None and not _owned_document(document, owner):
                 continue
-            words = re.findall(r"\w+", chunk["content"].lower())
+            words = re.findall(r"\w+", (chunk.get("heading", "") + "\n" + chunk["content"]).lower())
             overlap = terms.intersection(words)
             if not overlap:
                 continue
@@ -612,7 +617,8 @@ async def check_schema():
         rows = await fetch("SELECT version FROM schema_migrations")
     except asyncpg.UndefinedTableError as error:
         raise RuntimeError("Database migrations must be applied before serving requests") from error
-    expected = {"001_legacy_columns", "002_private_storage", "003_hash_attribution", "004_auth_rate_limits"}
+    expected = {"001_legacy_columns", "002_private_storage", "003_hash_attribution", "004_auth_rate_limits",
+                "005_chunk_headings"}
     if not expected.issubset({row["version"] for row in rows}):
         raise RuntimeError("Database migrations must be applied before serving requests")
 

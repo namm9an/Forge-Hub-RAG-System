@@ -418,7 +418,7 @@ async def run_benchmark(settings, session_id, output_dir):
                 rerank_score=source.rerank_score,
             ) for source in retained_sources]
             generation_backends.add(result.generation_backend)
-            reranker_backends.add(get_reranker(settings.reranker_model).backend)
+            reranker_backends.add(get_reranker(settings.reranker_model, settings.reranker_max_length).backend)
 
             generation_latencies.append(g_ms)
             tot_ms = (perf_counter() - t_q_start) * 1000.0

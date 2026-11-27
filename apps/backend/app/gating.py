@@ -181,24 +181,36 @@ class CrossEncoderReranker:
     package is not installed.
     Supports both SearchResultItem instances and dictionary representations.
     """
-    def __init__(self, model_name: str = "ms-marco-TinyBERT-L-2-v2"):
+    def __init__(self, model_name: str = "ms-marco-TinyBERT-L-2-v2", max_length: int = 512):
         self.model_name = model_name
+        self.max_length = max_length
         self._ranker = None
         self._flashrank_checked = False
         self._lock = threading.Lock()
         self.backend = "heuristic"
 
     def _get_ranker(self):
-        if not self._flashrank_checked:
-            self._flashrank_checked = True
-            try:
-                from flashrank import Ranker
-                self._ranker = Ranker(model_name=self.model_name)
-                logger.info("Initialized FlashRank cross-encoder with model {}", self.model_name)
-            except Exception as e:
-                logger.info("FlashRank unavailable ({}); heuristic ranking active.", type(e).__name__)
-                self._ranker = None
-        return self._ranker
+        with self._lock:
+            if not self._flashrank_checked:
+                self._flashrank_checked = True
+                try:
+                    from flashrank import Ranker
+                    from flashrank.Config import model_file_map
+                    import onnxruntime as ort
+
+                    ranker = Ranker(model_name=self.model_name, max_length=self.max_length)
+                    if getattr(ranker, "session", None) is not None:
+                        options = ort.SessionOptions()
+                        options.intra_op_num_threads = options.inter_op_num_threads = 1
+                        ranker.session = ort.InferenceSession(
+                            str(ranker.model_dir / model_file_map[self.model_name]), sess_options=options,
+                            providers=ranker.session.get_providers(),
+                        )
+                    self._ranker = ranker
+                    logger.info("Initialized FlashRank cross-encoder with model {}", self.model_name)
+                except Exception as e:
+                    logger.info("FlashRank unavailable ({}); heuristic ranking active.", type(e).__name__)
+            return self._ranker
 
     def _compute_fallback_score(self, item: Any, query: str) -> float:
         content = getattr(item, "content", "") if not isinstance(item, dict) else item.get("content", "")
@@ -222,9 +234,7 @@ class CrossEncoderReranker:
         *,
         require_neural: bool = False,
     ) -> List[Union[SearchResultItem, Dict[str, Any]]]:
-        # Model initialization and inference share one lock across worker threads.
-        with self._lock:
-            return self._rerank(query, candidates, top_k, require_neural)
+        return self._rerank(query, candidates, top_k, require_neural)
 
     def _rerank(self, query, candidates, top_k, require_neural):
         if not candidates:
@@ -242,7 +252,11 @@ class CrossEncoderReranker:
                     for i, c in enumerate(items)
                 ]
                 rerank_req = RerankRequest(query=query, passages=passages)
-                results = ranker.rerank(rerank_req)
+                if getattr(ranker, "llm_model", None) is not None:
+                    with self._lock:
+                        results = ranker.rerank(rerank_req)
+                else:
+                    results = ranker.rerank(rerank_req)
 
                 score_map = {int(r["id"]): float(r["score"]) for r in results if "id" in r and "score" in r}
                 if (len(results) != len(items) or set(score_map) != set(range(len(items)))
@@ -294,11 +308,11 @@ _global_reranker: Optional[CrossEncoderReranker] = None
 _reranker_init_lock = threading.Lock()
 
 
-def get_reranker(model_name: str = "ms-marco-TinyBERT-L-2-v2") -> CrossEncoderReranker:
+def get_reranker(model_name: str = "ms-marco-TinyBERT-L-2-v2", max_length: int = 512) -> CrossEncoderReranker:
     global _global_reranker
     with _reranker_init_lock:
-        if _global_reranker is None or _global_reranker.model_name != model_name:
-            _global_reranker = CrossEncoderReranker(model_name=model_name)
+        if _global_reranker is None or (_global_reranker.model_name, _global_reranker.max_length) != (model_name, max_length):
+            _global_reranker = CrossEncoderReranker(model_name=model_name, max_length=max_length)
     return _global_reranker
 
 

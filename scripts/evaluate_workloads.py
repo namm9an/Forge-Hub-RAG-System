@@ -253,7 +253,7 @@ async def isolated_http(settings, startup_timeout):
                 stack.enter_context(patch.object(module, "get_settings", lambda: settings))
             await database.ensure_schema()
             gating = importlib.import_module("app.gating")
-            reranker = gating.get_reranker(settings.reranker_model)
+            reranker = gating.get_reranker(settings.reranker_model, settings.reranker_max_length)
             observed_inference = Counter()
             original_rerank = reranker._rerank
 
@@ -719,7 +719,7 @@ async def run(args):
             "embedding_model": settings.embedding_model, "reranker_model": settings.reranker_model,
             "provider_keys": "disabled", "models": "Real local encoder + FlashRank warmup required"},
         "limitations": ["No external LLM calls; extractive fallback is not semantic answer-quality evidence",
-            "Default admission may return 503; per-owner rate rejection is 429; both count as failed requests",
+            "Admission saturation and per-owner rate rejection return HTTP 429 and count as failed requests.",
             "The 50-worker read profile uses ten signed owners, so the default owner budget constrains its throughput.",
             "Loopback synthetic test identities and operator-created disposable schema do not establish production IdP/runtime-role readiness"],
         "workloads": {}, "backend_release_gate": "INCOMPLETE"}

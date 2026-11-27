@@ -1,11 +1,13 @@
 import asyncio
+import re
 from time import perf_counter
 from typing import List, Dict, Any, Optional
+from uuid import UUID
 from fastapi import APIRouter, Query, Depends, HTTPException
 
 from .config import get_settings, Settings
 from .auth import Principal, require_user
-from .db import fetch
+from .db import fetch, get_pool
 from .embeddings import get_model_async, embed_query, _as_pgvector
 from .schemas import HybridSearchRequest, HybridSearchResponse, SearchResultItem
 from .sessions import authorize_session
@@ -52,8 +54,6 @@ async def _sparse_search(
     Retry empty ordinary questions with English-normalized OR terms. Explicit
     web-search operators retain their native semantics without relaxation.
     """
-    import re
-
     if not session_id or not user_id:
         raise ValueError("Sparse retrieval requires an owned session")
     if len(query_text) > 4000:
@@ -162,7 +162,7 @@ async def retrieve_candidates(
 ) -> List[SearchResultItem]:
     """One owner-scoped retrieval path shared by search and chat."""
     model = await get_model_async(settings)
-    query_vector = _as_pgvector(await embed_query(model, query))
+    query_vector = _as_pgvector(await embed_query(model, query, cache_owner=user_id))
     dense, sparse = await asyncio.gather(
         _dense_search(query_vector, session_id, candidate_k, user_id=user_id),
         _sparse_search(query, session_id, candidate_k, user_id=user_id),
@@ -173,6 +173,55 @@ async def retrieve_candidates(
         sparse_weight=sparse_weight if sparse_weight is not None else settings.sparse_weight,
         top_k=candidate_k,
     )
+
+
+async def _semantic_duplicate_pairs(chunk_ids, session_id: str, user_id: str):
+    # The memory adapter has no semantic-model contract, including fixed test encoders.
+    if await get_pool() is None:
+        return set()
+    rows = await fetch(
+        """
+        WITH owned_candidates AS MATERIALIZED (
+            SELECT e.chunk_id, e.embedding, e.model_version
+            FROM embeddings e
+            JOIN chunks c ON c.id = e.chunk_id
+            JOIN documents d ON d.id = c.document_id
+            JOIN sessions s ON s.session_id = d.session_id
+            WHERE c.id = ANY($1::uuid[]) AND d.session_id = $2 AND s.user_id = $3
+        )
+        SELECT a.chunk_id AS left_id, b.chunk_id AS right_id
+        FROM owned_candidates a
+        JOIN owned_candidates b ON a.chunk_id < b.chunk_id AND a.model_version = b.model_version
+        WHERE 1 - (a.embedding <=> b.embedding) >= $4::double precision
+        """,
+        [UUID(chunk_id) for chunk_id in chunk_ids], session_id, user_id, 0.97,
+    )
+    return {frozenset((str(row["left_id"]), str(row["right_id"]))) for row in rows}
+
+
+async def deduplicate_ranked_candidates(candidates, *, top_k: int, session_id: str, user_id: str):
+    """Keep the best-ranked representative and fill remaining slots with distinct parents."""
+    if top_k == 1 or len(candidates) < 2:
+        return candidates[:top_k]
+    chunk_ids = [str(item["chunk_id"] if isinstance(item, dict) else item.chunk_id) for item in candidates]
+    semantic_pairs = await _semantic_duplicate_pairs(chunk_ids, session_id, user_id)
+    kept = []
+    for item, chunk_id in zip(candidates, chunk_ids):
+        content = item["content"] if isinstance(item, dict) else item.content
+        text = " ".join(content.casefold().split())
+        words = re.findall(r"\w+", text)
+        shingles = {tuple(words[start:start + 5]) for start in range(len(words) - 4)}
+        if any(
+            (text and text == other_text)
+            or frozenset((chunk_id, other_id)) in semantic_pairs
+            or (shingles and other_shingles and len(shingles & other_shingles) / len(shingles | other_shingles) >= 0.8)
+            for _, other_id, other_text, other_shingles in kept
+        ):
+            continue
+        kept.append((item, chunk_id, text, shingles))
+        if len(kept) == top_k:
+            break
+    return [item for item, _, _, _ in kept]
 
 
 @router.post("/hybrid", response_model=HybridSearchResponse)

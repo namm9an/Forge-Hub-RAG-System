@@ -26,11 +26,14 @@ CREATE TABLE IF NOT EXISTS chunks (
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
+    heading TEXT NOT NULL DEFAULT '',
     content_hash TEXT NOT NULL,
     page_number INTEGER NOT NULL DEFAULT 1,
     page_numbers INTEGER[] NOT NULL DEFAULT '{}',
     token_count INTEGER NOT NULL DEFAULT 0,
-    content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+    content_tsv tsvector GENERATED ALWAYS AS (
+        to_tsvector('english', CASE WHEN heading = '' THEN content ELSE heading || chr(10) || content END)
+    ) STORED,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(document_id, chunk_index),
     CONSTRAINT chunks_document_hash_unique UNIQUE(document_id, content_hash)

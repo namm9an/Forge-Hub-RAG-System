@@ -15,11 +15,12 @@ from loguru import logger
 from .auth import Principal, require_user
 from .config import get_settings, Settings
 from .db import execute, fetch, fetchval, transaction
-from .embeddings import _as_pgvector, _embed_texts, get_model, get_model_async, run_blocking
+from .embeddings import _as_pgvector, _embed_texts, _index_text, get_model, get_model_async, run_blocking
 from .schemas import DocumentsResponse, DocumentInfo
 from .sessions import authorize_session
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
+_SECTION_HEADING = re.compile(r"^(?:CHAPTER\s+\d+|\d+(?:\.\d+){1,4}\.?\s+.{2,90}|#{1,6}\s+.{2,90})$")
 
 
 def _hash_text(text: str) -> str:
@@ -102,14 +103,14 @@ def _full_ruled_table(table):
             and math.isclose(cell_area, (right - left) * (bottom - top)))
 
 
-def _extract_page_text(page):
+def _extract_page_text(page, *, x_tolerance=3.0):
     # shortcut: handle clearly ruled tables with bounded geometry; review
     # layout detection separately for borderless or drawing-heavy pages.
     if not 4 <= len(page.edges) <= 256:
-        return page.extract_text(use_text_flow=True) or ""
+        return page.extract_text(use_text_flow=True, x_tolerance=x_tolerance) or ""
     tables = [table for table in page.find_tables() if _full_ruled_table(table)]
     if not tables:
-        return page.extract_text(use_text_flow=True) or ""
+        return page.extract_text(use_text_flow=True, x_tolerance=x_tolerance) or ""
 
     def table_index(char):
         x = (char["x0"] + char["x1"]) / 2
@@ -125,7 +126,7 @@ def _extract_page_text(page):
             prose.append(char)
         elif index not in emitted:
             if prose:
-                blocks.append(pdfplumber.utils.extract_text(prose, use_text_flow=True))
+                blocks.append(pdfplumber.utils.extract_text(prose, use_text_flow=True, x_tolerance=x_tolerance))
                 prose.clear()
             for row in tables[index].extract():
                 cells = [" ".join(cell.split()) if cell else "" for cell in row]
@@ -135,7 +136,7 @@ def _extract_page_text(page):
                     blocks.append(" | ".join(cells))
             emitted.add(index)
     if prose:
-        blocks.append(pdfplumber.utils.extract_text(prose, use_text_flow=True))
+        blocks.append(pdfplumber.utils.extract_text(prose, use_text_flow=True, x_tolerance=x_tolerance))
     return "\n".join(block for block in blocks if block)
 
 
@@ -158,7 +159,7 @@ def _extract_pdf(file_bytes: bytes, settings: Settings):
 
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            result = collect(pdf.pages, _extract_page_text)
+            result = collect(pdf.pages, lambda page: _extract_page_text(page, x_tolerance=settings.pdf_x_tolerance))
             if result[0]:
                 return result
     except HTTPException:
@@ -176,9 +177,15 @@ def _extract_pdf(file_bytes: bytes, settings: Settings):
     return result
 
 
+def _last_section_heading(text):
+    return next((line.strip() for line in reversed(text.splitlines())
+                 if _SECTION_HEADING.fullmatch(line.strip())), "")
+
+
 def _prepare_pdf(file_bytes, filename, settings, tokenizer, token_budget):
     pages, total_pages = _extract_pdf(file_bytes, settings)
     records, by_hash, raw_chunks = [], {}, 0
+    previous_heading = ""
     for page_number, text in pages:
         chunks = recursive_token_chunk(text, max_tokens=token_budget, overlap_tokens=settings.chunk_overlap_tokens, tokenizer=tokenizer)
         raw_chunks += len(chunks)
@@ -191,10 +198,17 @@ def _prepare_pdf(file_bytes, filename, settings, tokenizer, token_budget):
                 if page_number not in record["page_numbers"]:
                     record["page_numbers"].append(page_number)
                 continue
-            record = {"content": content, "content_hash": content_hash, "page_number": page_number,
+            start = text.find(content)
+            heading = (_last_section_heading(text[:start].rpartition("\n")[0]) if start >= 0 else "") or previous_heading
+            first_line = content.lstrip().partition("\n")[0].strip()
+            if heading and (_SECTION_HEADING.fullmatch(first_line) or
+                            " ".join(heading.casefold().split()) in " ".join(content.casefold().split())):
+                heading = ""
+            record = {"content": content, "heading": heading, "content_hash": content_hash, "page_number": page_number,
                       "page_numbers": [page_number], "token_count": token_count, "chunk_index": len(records)}
             records.append(record)
             by_hash[content_hash] = record
+        previous_heading = _last_section_heading(text) or previous_heading
     if not records:
         raise HTTPException(status_code=422, detail="PDF contains no usable text")
     return {"filename": filename, "file_size": len(file_bytes), "total_pages": total_pages, "chunks": records}
@@ -329,18 +343,18 @@ async def upload_documents(
             for start in range(0, len(document["chunks"]), 16):
                 batch = document["chunks"][start:start + 16]
                 try:
-                    vectors = await _embed_texts(model, [chunk["content"] for chunk in batch])
+                    vectors = await _embed_texts(model, [_index_text(chunk["content"], chunk["heading"]) for chunk in batch])
                 except Exception as exc:
                     logger.warning("Document embedding failed: {}", type(exc).__name__)
                     raise HTTPException(status_code=503, detail="Document embedding preparation is unavailable") from exc
                 for chunk, vector in zip(batch, vectors):
                     chunk_id = await fetchval(
                         """
-                        INSERT INTO chunks (document_id, chunk_index, content, content_hash, page_number, token_count, page_numbers)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
+                        INSERT INTO chunks (document_id, chunk_index, content, content_hash, page_number, token_count, page_numbers, heading)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id
                         """,
                         doc_id, chunk["chunk_index"], chunk["content"], chunk["content_hash"],
-                        chunk["page_number"], chunk["token_count"], chunk["page_numbers"],
+                        chunk["page_number"], chunk["token_count"], chunk["page_numbers"], chunk["heading"],
                     )
                     await execute(
                         "INSERT INTO embeddings (chunk_id, embedding, model_version) VALUES ($1, $2::vector, $3)",

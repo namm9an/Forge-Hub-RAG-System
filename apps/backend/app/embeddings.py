@@ -2,6 +2,7 @@ import asyncio
 from collections import OrderedDict
 from contextlib import ExitStack
 from functools import partial
+from hashlib import sha256
 from itertools import chain
 import threading
 from typing import List, Optional
@@ -23,6 +24,10 @@ _model_lock = threading.Lock()
 _work_limits = weakref.WeakKeyDictionary()
 _reranking_limits = weakref.WeakKeyDictionary()
 _query_batchers = weakref.WeakKeyDictionary()
+_query_cache_lock = threading.Lock()
+_query_cache_model = None
+_query_embeddings = OrderedDict()
+_QUERY_CACHE_SIZE = 1024
 
 
 def _blocking_workers():
@@ -40,12 +45,13 @@ def _work_limit(limits, loop, capacity):
 
 async def _run_blocking(prepare, *, reranking=False):
     loop = asyncio.get_running_loop()
+    rank_workers = getattr(get_settings(), "reranker_workers", 1)
     with ExitStack() as acquired:
         if reranking:
-            lane = _work_limit(_reranking_limits, loop, 1)
+            lane = _work_limit(_reranking_limits, loop, rank_workers)
             await lane.acquire()
             acquired.callback(lane.release)
-        limiter = _work_limit(_work_limits, loop, _blocking_workers())
+        limiter = _work_limit(_work_limits, loop, max(_blocking_workers(), rank_workers))
         await limiter.acquire()
         acquired.callback(limiter.release)
         work = prepare()
@@ -69,7 +75,7 @@ async def run_blocking(function, *args, **kwargs):
 
 
 async def run_reranking(function, *args, **kwargs):
-    """Wait for the serial ranker before reserving any shared CPU capacity."""
+    """Wait for reranking capacity before reserving a shared CPU worker."""
     return await _run_blocking(lambda: partial(function, *args, **kwargs), reranking=True)
 
 
@@ -78,6 +84,11 @@ def get_model(settings) -> SentenceTransformer:
     global _model
     with _model_lock:
         if _model is None:
+            import torch
+
+            torch.set_num_threads(1)
+            if torch.get_num_interop_threads() != 1:
+                torch.set_num_interop_threads(1)
             logger.info("Loading configured embedding model")
             _model = SentenceTransformer(settings.embedding_model)
     return _model
@@ -110,6 +121,10 @@ def _encode_texts(model: SentenceTransformer, texts: List[str], batch_size: int 
 
 async def _embed_texts(model: SentenceTransformer, texts: List[str], batch_size: int = 16) -> List[List[float]]:
     return await run_blocking(_encode_texts, model, texts, batch_size) if texts else []
+
+
+def _index_text(content, heading):
+    return f"{heading}\n{content}" if heading else content
 
 
 class _QueryBatcher:
@@ -177,12 +192,30 @@ class _QueryBatcher:
                 result.set_result(vector)
 
 
-async def embed_query(model: SentenceTransformer, query: str) -> List[float]:
+async def embed_query(model: SentenceTransformer, query: str, *, cache_owner: Optional[str] = None) -> List[float]:
+    global _query_cache_model
+    key = (cache_owner, sha256(query.encode()).digest())
+    with _query_cache_lock:
+        if _query_cache_model is not model:
+            _query_embeddings.clear()
+            _query_cache_model = model
+        cached = _query_embeddings.get(key)
+        if cached is not None:
+            _query_embeddings.move_to_end(key)
+            return list(cached)
+
     loop = asyncio.get_running_loop()
     batcher = _query_batchers.get(loop)
     if batcher is None or batcher.model is not model:
         batcher = _query_batchers[loop] = _QueryBatcher(model)
-    return await batcher.encode(query)
+    vector = await batcher.encode(query)
+    with _query_cache_lock:
+        if _query_cache_model is model:
+            _query_embeddings[key] = tuple(vector)
+            _query_embeddings.move_to_end(key)
+            if len(_query_embeddings) > _QUERY_CACHE_SIZE:
+                _query_embeddings.popitem(last=False)
+    return vector
 
 
 @router.post("/generate")
@@ -202,7 +235,7 @@ async def generate_all_missing(
         await authorize_session(sid, principal.user_id)
         rows = await fetch(
             """
-            SELECT c.id, c.content
+            SELECT c.id, c.content, c.heading
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
             LEFT JOIN embeddings e ON e.chunk_id = c.id
@@ -222,7 +255,7 @@ async def generate_all_missing(
         for start in range(0, len(rows), 16):
             batch = rows[start:start + 16]
             try:
-                vectors = await _embed_texts(model, [row["content"] for row in batch])
+                vectors = await _embed_texts(model, [_index_text(row["content"], row["heading"]) for row in batch])
             except Exception as exc:
                 logger.warning("Scoped embedding generation failed: {}", type(exc).__name__)
                 raise HTTPException(status_code=503, detail="Embedding generation is unavailable") from exc

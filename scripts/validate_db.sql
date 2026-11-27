@@ -32,7 +32,7 @@ BEGIN
          WHERE NOT EXISTS (SELECT 1 FROM %I.schema_migrations WHERE version = required.version)',
         app_schema
     ) INTO missing USING ARRAY['001_legacy_columns', '002_private_storage',
-                              '003_hash_attribution', '004_auth_rate_limits'];
+                              '003_hash_attribution', '004_auth_rate_limits', '005_chunk_headings'];
     IF missing IS NOT NULL THEN
         RAISE EXCEPTION 'Missing migration versions in schema %: %', app_schema, missing;
     END IF;

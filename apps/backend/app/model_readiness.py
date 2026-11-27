@@ -8,7 +8,7 @@ async def warmup_models(settings):
     if getattr(model, "tokenizer", None) is None:
         raise RuntimeError("Embedding tokenizer is unavailable")
     await _embed_texts(model, ["Backend readiness verification."])
-    reranker = get_reranker(settings.reranker_model)
+    reranker = get_reranker(settings.reranker_model, settings.reranker_max_length)
     await run_reranking(reranker.rerank, query="readiness", candidates=[
         {"content": "Backend readiness verification.", "dense_score": 1.0, "sparse_score": 0.0},
     ])
